@@ -354,7 +354,13 @@ export default function Home() {
           {page==="users" && role==="administrator" && <UsersPage notify={notify} profile={profile} currentUser={currentUser}/>}
           {page==="history" && <HistoryPage profile={profile} role={role}/>}
           {page==="reports" && <ReportsPage claims={scopedClaims} notify={notify} logActivity={logActivity}/>}
-          {page==="archive" && role==="administrator" && <ArchivePage profile={profile} notify={notify} recordError={recordSystemError}/>}
+          {page==="archive" && role==="administrator" && <ArchivePage profile={profile} notify={notify} recordError={recordSystemError} onRestore={(item)=>{
+            if(item.sourceCollection==="claims"){
+              setClaims(prev=>[item.data as Claim, ...prev.filter(c=>c.id!==item.sourceId)]);
+            } else {
+              setRetirees(prev=>[item.data as Retiree, ...prev.filter(r=>r.id!==item.sourceId)]);
+            }
+          }}/>}
           {page==="errors" && role==="administrator" && <ErrorCenter notify={notify} lastSyncAt={lastSyncAt}/>}
           {page==="validation" && role==="administrator" && <ValidationPage claims={claims} retirees={retirees}/>}
           {page==="profile" && <ProfilePage profile={profile} role={role} notify={notify}/>}
@@ -1075,13 +1081,42 @@ function AnnouncementsPage({profile,role,notify}:{profile:UserProfile;role:Role;
 }
 
 type ArchivedRecord={id:string;sourceCollection:"claims"|"retirees";sourceId:string;data:Claim|Retiree;reason:string;archivedBy:string;archivedAt?:{toDate?:()=>Date}};
-function ArchivePage({profile,notify,recordError}:{profile:UserProfile;notify:(s:string)=>void;recordError:(context:string,error:unknown)=>Promise<void>}) {
+function ArchivePage({profile,notify,recordError,onRestore}:{profile:UserProfile;notify:(s:string)=>void;recordError:(context:string,error:unknown)=>Promise<void>;onRestore:(item:ArchivedRecord)=>void}) {
   const [items,setItems]=useState<ArchivedRecord[]>([]);
   useEffect(()=>{
     if(!db)return;
     return onSnapshot(collection(db,"archivedRecords"),snapshot=>setItems(snapshot.docs.map(item=>({id:item.id,...item.data()} as ArchivedRecord)).sort((a,b)=>(b.archivedAt?.toDate?.().getTime()||0)-(a.archivedAt?.toDate?.().getTime()||0))),error=>{void recordError("Archive retrieval failed",error);notify("Unable to load archived records.")});
   },[notify,recordError]);
-  const restore=async(item:ArchivedRecord)=>{if(!db||!auth?.currentUser)return;if(!confirm(`Restore ${item.sourceId} to active records?`))return;try{const batch=writeBatch(db);batch.set(doc(db,item.sourceCollection,item.sourceId),item.data);batch.delete(doc(db,"archivedRecords",item.id));batch.set(doc(collection(db,"activityHistory")),{action:"Archived record restored",details:`${item.sourceId} restored to ${item.sourceCollection}`,recordType:item.sourceCollection==="claims"?"claim":"retiree",recordId:item.sourceId,unit:"province" in item.data?item.data.province:item.data.unit,actorUid:auth.currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:{archived:true,reason:item.reason},newValue:item.data,createdAt:serverTimestamp()});await batch.commit();notify("Record restored to active monitoring.");}catch(error){void recordError("Archive restoration failed",error);notify("Restore failed. The archived copy remains intact.");}};
+  const restore=async(item:ArchivedRecord)=>{
+    if(!db||!auth?.currentUser)return;
+    if(!confirm(`Restore ${item.sourceId} to active records?`))return;
+    try{
+      const batch=writeBatch(db);
+      const sanitizedData = sanitizeRecord(item.data as Record<string, unknown>);
+      batch.set(doc(db,item.sourceCollection,item.sourceId),sanitizedData);
+      batch.delete(doc(db,"archivedRecords",item.id));
+      batch.set(doc(collection(db,"activityHistory")),{
+        action:"Archived record restored",
+        details:`${item.sourceId} restored to ${item.sourceCollection}`,
+        recordType:item.sourceCollection==="claims"?"claim":"retiree",
+        recordId:item.sourceId,
+        unit:("province" in item.data ? item.data.province : item.data.unit) || profile.unit || "RHQ",
+        actorUid:auth.currentUser.uid,
+        actorName:profile.displayName,
+        actorRole:profile.role,
+        oldValue:{archived:true,reason:item.reason},
+        newValue:sanitizedData,
+        createdAt:serverTimestamp()
+      });
+      await batch.commit();
+      onRestore(item);
+      notify("Record restored to active monitoring.");
+    }catch(error){
+      console.error("Restore error:", error);
+      void recordError("Archive restoration failed",error);
+      notify("Restore failed. Check network or security permissions.");
+    }
+  };
   const erase=async(item:ArchivedRecord)=>{if(!db||!auth?.currentUser)return;const reason=prompt("Permanent deletion reason:")?.trim();if(!reason)return;const confirmation=prompt(`Type DELETE ${item.sourceId} to permanently remove this archived record.`);if(confirmation!==`DELETE ${item.sourceId}`){notify("Permanent deletion cancelled.");return;}try{const batch=writeBatch(db);batch.delete(doc(db,"archivedRecords",item.id));batch.set(doc(collection(db,"activityHistory")),{action:"Archived record permanently deleted",details:`${item.sourceId} • ${reason}`,recordType:item.sourceCollection==="claims"?"claim":"retiree",recordId:item.sourceId,unit:"RCD",actorUid:auth.currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:item,newValue:null,createdAt:serverTimestamp()});await batch.commit();notify("Archived record permanently deleted.");}catch(error){void recordError("Permanent archive deletion failed",error);notify("Permanent deletion failed.");}};
   return <div className="stack"><section className="report-head"><div><p>Administrator Recovery</p><h3>Archive and Recovery</h3><span>Archived records do not appear in active dashboards or reports and remain recoverable here.</span></div><Archive/></section><section className="panel registry"><PanelHead title="Archived Records" copy={`${items.length} recoverable records`}/><div className="table-wrap"><table><thead><tr><th>Record</th><th>Personnel</th><th>Reason</th><th>Archived</th><th>Actions</th></tr></thead><tbody>{items.map(item=><tr key={item.id}><td><strong>{item.sourceId}</strong><small>{item.sourceCollection}</small></td><td>{"rank" in item.data?`${item.data.rank} ${item.data.name}`:"—"}</td><td>{item.reason}</td><td>{item.archivedAt?.toDate?.().toLocaleString("en-PH")||"Syncing…"}<small>{item.archivedBy}</small></td><td><div className="actions"><button className="edit" onClick={()=>restore(item)}><RefreshCw/> Restore</button><button className="delete" onClick={()=>erase(item)}><Trash2/> Permanent Delete</button></div></td></tr>)}</tbody></table>{!items.length&&<div className="empty">No archived records.</div>}</div></section></div>;
 }
