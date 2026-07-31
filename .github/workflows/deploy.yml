@@ -47,7 +47,7 @@ jobs:
       - name: Prepare GitHub Pages artifact
         run: |
           touch dist/client/.nojekyll
-          cp public/favicon-retirees-kipowipo.png dist/client/ 2>/dev/null || true
+          echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>PRO 4A Retirees and KIPO/WIPO Monitoring System</title><link rel="icon" type="image/png" href="./favicon-retirees-kipowipo.png"></head><body><div id="root"></div></body></html>' > dist/client/index.html
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v3
