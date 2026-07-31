@@ -4,7 +4,7 @@ import { getFirestore } from "firebase/firestore";
 
 // Firebase web-app configuration from environment variables.
 const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "",
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "AIzaSyC0C4raTCm6qw85kM1Hpm6UGCOVgJiozBg",
   authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN || "pro4a-retirees-kipo-wipo.firebaseapp.com",
   projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || "pro4a-retirees-kipo-wipo",
   storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET || "pro4a-retirees-kipo-wipo.firebasestorage.app",
