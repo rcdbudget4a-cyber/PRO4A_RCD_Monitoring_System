@@ -796,6 +796,16 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
     try{
       const XLSX=await import("xlsx");
       const workbook=XLSX.read(await file.arrayBuffer(),{type:"array",cellDates:true});
+      const fileText = `${file.name} ${workbook.SheetNames.join(" ")}`.toLowerCase();
+      let activeKind: ImportKind = kind;
+      if (/retiree|compulsory|cal\b/i.test(fileText) && !/kipo|wipo/i.test(fileText)) {
+        activeKind = "retirees";
+        setKind("retirees");
+      } else if (/kipo|wipo/i.test(fileText)) {
+        activeKind = "claims";
+        setKind("claims");
+      }
+
       const selected=workbook.SheetNames.map((name,index)=>{
         const sheet=workbook.Sheets[name];
         const matrix=XLSX.utils.sheet_to_json<unknown[]>(sheet,{header:1,defval:"",raw:false,dateNF:"yyyy-mm-dd"});
@@ -803,29 +813,53 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
         const fileYear=file.name.match(/20\d{2}/)?.[0]||"";
         const sheetYear=name.match(/20\d{2}/)?.[0]||"";
         const headingYear=heading.match(/20\d{2}/)?.[0]||"";
-        const expectedKind=kind==="retirees"?/COMPULSORY RETIREE/.test(heading):/\b(KIPO|WIPO)\b/.test(heading);
+        const expectedKind=activeKind==="retirees"?/COMPULSORY|RETIREE|CAL/.test(`${name} ${heading}`):/\b(KIPO|WIPO)\b/.test(`${name} ${heading}`);
         const yearMatch=Boolean(fileYear&&(sheetYear===fileYear||headingYear===fileYear));
-        return {sheet,matrix,index,score:(expectedKind?10:0)+(yearMatch?20:0)+(sheetYear===fileYear?5:0)};
+        return {sheet,matrix,index,score:(expectedKind?20:0)+(yearMatch?20:0)+(sheetYear===fileYear?5:0)};
       }).sort((a,b)=>b.score-a.score||a.index-b.index)[0];
+
       const sheet=selected.sheet;
       const matrix=selected.matrix;
-      const official=kind==="claims"?parseOfficialClaims(matrix,file.name):parseOfficialRetirees(matrix,file.name);
+      const official=activeKind==="claims"?parseOfficialClaims(matrix,file.name):parseOfficialRetirees(matrix,file.name);
       const raw=XLSX.utils.sheet_to_json<Record<string,unknown>>(sheet,{defval:"",raw:false,dateNF:"yyyy-mm-dd"});
       if(!raw.length&&!official?.length)throw new Error("The selected file has no data rows.");
-      const existingDocs=db?(await getDocs(collection(db,kind))).docs:[];
-      const existing=new Set(existingDocs.map(item=>item.id.toLowerCase()));
-      const existingPersonnel=new Set(existingDocs.map(item=>{const record=item.data() as Claim|Retiree;return "province" in record?personnelKey(record.rank,record.name,record.province,record.date):personnelKey(record.rank,record.name,record.unit||"",record.retirementDate)}));
+
+      const existingDocs=db?(await getDocs(collection(db,activeKind))).docs:[];
+      const existingIds=new Set(existingDocs.map(item=>item.id.toLowerCase()));
+      const existingPersonnel=new Set(existingDocs.map(item=>{
+        const record=item.data() as Claim|Retiree;
+        return "province" in record
+          ? personnelKey(record.rank,record.name,record.province,record.date)
+          : personnelKey(record.rank,record.name,record.unit||"",record.retirementDate);
+      }));
+
+      // Also merge seed records into duplicate detection
+      if (activeKind === "claims") {
+        (seedClaims as Claim[]).forEach(c => {
+          existingIds.add(c.id.toLowerCase());
+          existingPersonnel.add(personnelKey(c.rank,c.name,c.province,c.date));
+        });
+      } else {
+        (retireeRecords as Retiree[]).forEach(r => {
+          existingIds.add(r.id.toLowerCase());
+          existingPersonnel.add(personnelKey(r.rank,r.name,r.unit||"",r.retirementDate));
+        });
+      }
+
       const seen=new Set<string>();const seenPersonnel=new Set<string>();
       const setDuplicate=(item:ImportPreview)=>{
-        const key="province" in item.record?personnelKey(item.record.rank,item.record.name,item.record.province,item.record.date):personnelKey(item.record.rank,item.record.name,item.record.unit||"",item.record.retirementDate);
-        const duplicate=existing.has(item.id.toLowerCase())||seen.has(item.id.toLowerCase())||existingPersonnel.has(key)||seenPersonnel.has(key);
+        const key="province" in item.record
+          ? personnelKey(item.record.rank,item.record.name,item.record.province,item.record.date)
+          : personnelKey(item.record.rank,item.record.name,item.record.unit||"",item.record.retirementDate);
+        const duplicate=existingIds.has(item.id.toLowerCase())||seen.has(item.id.toLowerCase())||(Boolean(item.record.name)&&(existingPersonnel.has(key)||seenPersonnel.has(key)));
         if(item.id)seen.add(item.id.toLowerCase());
         if(key)seenPersonnel.add(key);
         return {...item,duplicate};
       };
+
       const preview=official?.map(setDuplicate)??raw.map((row,index)=>{
         const errors:string[]=[];
-        if(kind==="claims"){
+        if(activeKind==="claims"){
           const rawId=readCell(row,["Claim ID","ID","Record ID","Control No","No.","Serial","Item"]);
           const rawType=readCell(row,["Type","Claim Type","Category","Kind"]).toUpperCase();
           const claimType=rawType.includes("WIPO")?"WIPO":rawType.includes("KIPO")?"KIPO":"KIPO";
@@ -836,7 +870,11 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
           const unit=inferUnit(rawUnitText)||(operationalUnits.includes(rawUnitText)?rawUnitText:profile.unit||"RHQ");
           const office=readCell(row,["Office","Station","Office / Unit","Sub-Unit","Division"])||unit;
           const rawRank=readCell(row,["Rank","Designation","Title"]);
-          const rawName=readCell(row,["Name","Full Name","Personnel Name","Rank & Name","Name of Personnel","Personnel"]);
+          let rawName=readCell(row,["Name","Full Name","Personnel Name","Rank & Name","Name of Personnel","Personnel","Member Name"]);
+          if (!rawName) {
+            const vals = Object.values(row).map(v => String(v || "").trim()).filter(Boolean);
+            rawName = vals.find(v => /[a-zA-Z]{2,}/.test(v) && !/^\d+$/.test(v) && !normalizeDate(v) && v !== rawUnitText) || "";
+          }
           const parsedPerson=splitRankName(rawName);
           const rank=(rawRank||parsedPerson.rank||"PNP").toUpperCase();
           const name=(parsedPerson.name||rawName).toUpperCase();
@@ -845,8 +883,10 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
           const rawStatus=readCell(row,["Status","Claim Status","State"]);
           const record:Claim={id,type:claimType,year,rank,name,province:unit,office,stage:normalizeWorkflow(rawStage),status:normalizeClaimStatus(rawStatus,rawStage),date,dateDisplay:displayDate(date),injury:readCell(row,["Injury","Injury Information","Remarks"]),sourceCoverage:readCell(row,["Source Coverage","Coverage"])||`CY ${year}`,lastUpdateDate:isoToday()};
           if(!record.name)errors.push("Missing name");
-          const duplicate=existing.has(id.toLowerCase())||seen.has(id.toLowerCase());
+          const key=personnelKey(rank,name,unit,date);
+          const duplicate=existingIds.has(id.toLowerCase())||seen.has(id.toLowerCase())||(Boolean(name)&&(existingPersonnel.has(key)||seenPersonnel.has(key)));
           if(id)seen.add(id.toLowerCase());
+          if(key)seenPersonnel.add(key);
           return {row:index+2,id,valid:errors.length===0,duplicate,errors,record};
         }
         const rawId=readCell(row,["Retiree ID","ID","Record ID","Control No","No.","Serial","Item"]);
@@ -856,7 +896,11 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
         const rawUnitText=readCell(row,["Unit","Unit / Office","Office","PPO","Assigned Unit"]);
         const unit=inferUnit(rawUnitText)||(operationalUnits.includes(rawUnitText)?rawUnitText:profile.unit||"RHQ");
         const rawRank=readCell(row,["Rank","Designation","Title"]);
-        const rawName=readCell(row,["Name","Full Name","Personnel Name","Rank & Name","Name of Personnel","Personnel"]);
+        let rawName=readCell(row,["Name","Full Name","Personnel Name","Rank & Name","Name of Personnel","Personnel","Member Name"]);
+        if (!rawName) {
+          const vals = Object.values(row).map(v => String(v || "").trim()).filter(Boolean);
+          rawName = vals.find(v => /[a-zA-Z]{2,}/.test(v) && !/^\d+$/.test(v) && !normalizeDate(v) && v !== rawUnitText) || "";
+        }
         const parsedPerson=splitRankName(rawName);
         const rank=(rawRank||parsedPerson.rank||"PNP").toUpperCase();
         const name=(parsedPerson.name||rawName).toUpperCase();
@@ -868,12 +912,16 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
         const status=rawStatus||(complete?"Complete":/bos/i.test(`${calRequirements} ${lumpSumRequirements}`)?"Under BOS":"Pending Clearance");
         const record:Retiree={id,year,rank,name,unit,retirementDate,retirementDisplay:displayDate(retirementDate),calRequirements,lumpSumRequirements,status,calStatus:complete?"Processed":"Not Processed",remarks:readCell(row,["Remarks","Note","Notes"])||"Imported record",sourceCoverage:readCell(row,["Source Coverage","Coverage"])||`CY ${year}`,lastUpdateDate:isoToday()};
         if(!record.name)errors.push("Missing name");
-        const duplicate=existing.has(id.toLowerCase())||seen.has(id.toLowerCase());
+        const key=personnelKey(rank,name,unit,retirementDate);
+        const duplicate=existingIds.has(id.toLowerCase())||seen.has(id.toLowerCase())||(Boolean(name)&&(existingPersonnel.has(key)||seenPersonnel.has(key)));
         if(id)seen.add(id.toLowerCase());
+        if(key)seenPersonnel.add(key);
         return {row:index+2,id,valid:errors.length===0,duplicate,errors,record};
       });
       setRows(preview);
-      notify(`${preview.length} rows checked. Review the validation summary before importing.`);
+      const newCount = preview.filter(r => r.valid && !r.duplicate).length;
+      const dupCount = preview.filter(r => r.duplicate).length;
+      notify(`${preview.length} rows checked: ${newCount} new records ready, ${dupCount} duplicate records skipped.`);
     }catch(error){reset();notify(error instanceof Error?error.message:"Unable to read the selected file.");}
     finally{setBusy(false);}
   };
