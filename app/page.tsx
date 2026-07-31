@@ -56,6 +56,19 @@ const normalizeClaimStatus=(value:string,stage:string)=>{
   return "Pending";
 };
 const isoToday=()=>new Date().toISOString().slice(0,10);
+const sanitizeRecord = <T extends Record<string, unknown>>(obj: T): T => {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined) {
+      if (value && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
+        result[key] = sanitizeRecord(value as Record<string, unknown>);
+      } else {
+        result[key] = value;
+      }
+    }
+  }
+  return result as T;
+};
 const daysSince=(value?:string)=>value?Math.max(0,Math.floor((Date.now()-new Date(`${value}T00:00:00`).getTime())/86400000)):999;
 const personnelKey=(rank:string,name:string,unit:string,date:string)=>[rank,name,unit,date].map(value=>(value||"").toLowerCase().replace(/[^a-z0-9]/g,"")).join("|");
 const stableValue=(value:unknown):unknown=>{
@@ -507,11 +520,39 @@ function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notif
   const saveRetiree=async(record:Retiree)=>{
     if(role==="unit_user"&&!sameUnit(record.unit,profile.unit)){notify("You can only save retirees for your assigned unit.");return;}
     if(editing==="new"&&allRecords.some(existing=>existing.id.toLowerCase()===record.id.toLowerCase())){notify("Retiree ID already exists. Use a unique ID.");return;}
+    const sanitizedRecord = sanitizeRecord({
+      ...record,
+      unit: record.unit || profile.unit || "RHQ",
+      lastUpdateDate: record.lastUpdateDate || isoToday()
+    });
     try {
-      if(db&&auth?.currentUser){const batch=writeBatch(db);batch.set(doc(db,"retirees",record.id),record);batch.set(doc(collection(db,"activityHistory")),{action:editing==="new"?"Retiree created":"Retiree updated",details:`${record.rank} ${record.name}`,recordType:"retiree",recordId:record.id,unit:record.unit,actorUid:auth.currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:allRecords.find(r=>r.id===record.id)||null,newValue:record,createdAt:serverTimestamp()});await batch.commit();}
-    } catch { notify("Save failed. No partial record or audit entry was written."); return; }
-    setAllRecords(previous=>previous.some(r=>r.id===record.id)?previous.map(r=>r.id===record.id?record:r):[record,...previous]);
-    setEditing(null); notify("Retiree record saved.");
+      if(db&&auth?.currentUser){
+        const batch=writeBatch(db);
+        batch.set(doc(db,"retirees",sanitizedRecord.id),sanitizedRecord);
+        batch.set(doc(collection(db,"activityHistory")),{
+          action:editing==="new"?"Retiree created":"Retiree updated",
+          details:`${sanitizedRecord.rank} ${sanitizedRecord.name}`,
+          recordType:"retiree",
+          recordId:sanitizedRecord.id,
+          unit:sanitizedRecord.unit || profile.unit,
+          actorUid:auth.currentUser.uid,
+          actorName:profile.displayName,
+          actorRole:profile.role,
+          oldValue:allRecords.find(r=>r.id===sanitizedRecord.id)||null,
+          newValue:sanitizedRecord,
+          createdAt:serverTimestamp()
+        });
+        await batch.commit();
+      }
+    } catch (error) {
+      console.error("Retiree save error:", error);
+      void recordSystemError("Retiree save failed", error);
+      notify("Save failed. Check network or security permissions.");
+      return;
+    }
+    setAllRecords(previous=>previous.some(r=>r.id===sanitizedRecord.id)?previous.map(r=>r.id===sanitizedRecord.id?sanitizedRecord:r):[sanitizedRecord,...previous]);
+    setEditing(null);
+    notify(firebaseConfigured ? "Retiree record saved and synced to Firebase." : "Retiree record saved.");
   };
   const removeRetiree=async(id:string)=>{
     if(role!=="administrator"||!db||!auth?.currentUser){notify("Only administrators can archive retiree records.");return;}
