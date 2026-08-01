@@ -1,0 +1,27 @@
+{
+  "name": "PRO 4A Retirees and KIPO/WIPO Monitoring System",
+  "short_name": "PRO 4A RCD",
+  "description": "Authorized monitoring of KIPO/WIPO claims and compulsory retirees for PRO CALABARZON.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#071510",
+  "theme_color": "#006847",
+  "orientation": "any",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import PwaRegistrar from "./PwaRegistrar";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -15,6 +16,13 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "PRO 4A Retirees and KIPO/WIPO Monitoring System",
   description: "PRO 4A monitoring system for compulsory retirees and KIPO/WIPO records.",
+  applicationName: "PRO 4A RCD Monitoring",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "PRO 4A RCD",
+  },
   other: {
     "codex-preview": "development",
   },
@@ -36,6 +44,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         {children}
+        <PwaRegistrar />
       </body>
     </html>
   );
