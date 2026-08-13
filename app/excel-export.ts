@@ -177,19 +177,18 @@ export async function exportClaimsExcel(records: Claim[], filename = "PRO4A-KIPO
   }
 }
 
-export async function exportRetireesExcel(records: RetireeExportRecord[]) {
+export async function exportRetireesExcel(records: RetireeExportRecord[], prefix = "PRO4A-Retirees") {
   const groups = [...new Set(records.map(record => record.year))]
-    .filter(year => [2025, 2026].includes(year))
     .sort()
     .map(year => ({
       category: "Retirees" as const,
       year,
       records: records.filter(record => record.year === year),
     }));
-  if (!groups.length) throw new Error("There are no CY 2025 or CY 2026 retiree records to export.");
+  if (!groups.length) throw new Error("There are no retiree records to export.");
 
   for (const [index, group] of groups.entries()) {
-    downloadXlsx(await patchTemplate(group), `PRO4A-Retirees-${group.year}.xlsx`);
+    downloadXlsx(await patchTemplate(group), `${prefix}-${group.year}.xlsx`);
     if (index < groups.length - 1) await pauseBetweenDownloads();
   }
 }

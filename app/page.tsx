@@ -6,15 +6,16 @@ import { addDoc, collection, doc, getDocs, onSnapshot, query as firestoreQuery, 
 import { auth, db, firebaseConfigured } from "./firebase";
 import { seedClaims } from "./claims-data";
 import { retireeRecords } from "./retirees-data";
+import { optionalRetireeRecords } from "./optional-retirees-data";
 import { exportClaimsExcel, exportRetireesExcel } from "./excel-export";
 import {
   Activity, AlertTriangle, BarChart3, Bell, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Clock3, Download,
   Archive, Eye, EyeOff, FileSpreadsheet, FileText, FolderOpen, Gauge, LayoutDashboard, LogOut, Menu,
   Moon, Pencil, Plus, RefreshCw, Search, Send, ShieldCheck,
-  Sun, Trash2, Trophy, Upload, UserCog, Users, X, BadgeCheck
+  Sun, Trash2, Trophy, Upload, UserCheck, UserCog, Users, X, BadgeCheck
 } from "lucide-react";
 
-type Page = "dashboard" | "records" | "retirees" | "compliance" | "reconcile" | "announcements" | "help" | "import" | "users" | "history" | "reports" | "archive" | "errors" | "validation" | "profile";
+type Page = "dashboard" | "records" | "retirees" | "optional_retirees" | "compliance" | "reconcile" | "announcements" | "help" | "import" | "users" | "history" | "reports" | "archive" | "errors" | "validation" | "profile";
 type Role = "administrator" | "unit_user";
 type ClaimModalState = { mode: "new" | "view" | "edit"; claim?: Claim };
 type UserProfile = {
@@ -93,6 +94,7 @@ const nav = [
   ["dashboard", "Dashboard", LayoutDashboard],
   ["records", "KIPO/WIPO Records", FolderOpen],
   ["retirees", "Compulsory Retirees", BadgeCheck],
+  ["optional_retirees", "Optional Retirees", UserCheck],
   ["compliance", "Compliance & Scorecard", Trophy],
   ["reconcile", "Data Reconciliation", ClipboardCheck],
   ["announcements", "Announcements", Bell],
@@ -106,7 +108,7 @@ const nav = [
   ["validation", "Monthly Validation", Gauge],
   ["profile", "My Profile", UserCog],
 ] as const;
-const primaryNavKeys: Page[] = ["dashboard","records","retirees","import","users"];
+const primaryNavKeys: Page[] = ["dashboard","records","retirees","optional_retirees","import","users"];
 const otherNavKeys: Page[] = ["compliance","reconcile","announcements","help","history","reports","archive","errors","validation","profile"];
 const administratorOnlyPages: Page[] = ["import","users","reconcile","archive","errors","validation"];
 
@@ -122,6 +124,7 @@ export default function Home() {
   const [othersOpen, setOthersOpen] = useState(false);
   const [claims, setClaims] = useState<Claim[]>(seedClaims as Claim[]);
   const [retirees, setRetirees] = useState<Retiree[]>(retireeRecords as Retiree[]);
+  const [optionalRetirees, setOptionalRetirees] = useState<Retiree[]>(optionalRetireeRecords as Retiree[]);
   const [query, setQuery] = useState("");
   const [type, setType] = useState("All");
   const [status, setStatus] = useState("All");
@@ -202,6 +205,27 @@ export default function Home() {
     }, error => { void recordSystemError("Retiree synchronization failed",error); setToast("Unable to load retiree dashboard data."); setTimeout(() => setToast(""), 2500); });
   }, [profile]);
   const scopedRetirees = useMemo(() => role==="administrator" ? retirees : retirees.filter(r=>sameUnit(r.unit,profile?.unit)), [retirees,role,profile?.unit]);
+  useEffect(() => {
+    if (!db || !profile) return;
+    const source = profile.role === "admin"
+      ? collection(db, "optionalRetirees")
+      : firestoreQuery(collection(db, "optionalRetirees"), where("unit", "==", profile.unit));
+    return onSnapshot(source, snapshot => {
+      const docs = snapshot.docs.map(item => item.data() as Retiree);
+      const hasOldDummyData = snapshot.docs.some(doc => doc.id.startsWith("OPT-2025-")) || (profile.role === "admin" && snapshot.docs.length < optionalRetireeRecords.length);
+      if ((snapshot.empty || hasOldDummyData) && profile.role === "admin") {
+        const batch = writeBatch(db);
+        snapshot.docs.forEach(d => batch.delete(d.ref));
+        (optionalRetireeRecords as Retiree[]).forEach(record => batch.set(doc(db, "optionalRetirees", record.id), record));
+        batch.commit().catch(() => {});
+        setOptionalRetirees(optionalRetireeRecords as Retiree[]);
+      } else {
+        setOptionalRetirees(docs);
+      }
+      setLastSyncAt(new Date());
+    }, error => { void recordSystemError("Optional retiree synchronization failed",error); });
+  }, [profile]);
+  const scopedOptionalRetirees = useMemo(() => role==="administrator" ? optionalRetirees : optionalRetirees.filter(r=>sameUnit(r.unit,profile?.unit)), [optionalRetirees,role,profile?.unit]);
   const filtered = useMemo(() => scopedClaims.filter(c => {
     const haystack = `${c.id} ${c.rank} ${c.name} ${c.province} ${c.office} ${c.status}`.toLowerCase();
     return haystack.includes(query.toLowerCase()) && (type === "All" || c.type === type) && (claimYear === "All" || String(c.year) === claimYear) && (status === "All" || c.status === status);
@@ -343,9 +367,10 @@ export default function Home() {
           <div className="top-actions"><button onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button><span><ShieldCheck/>{role==="administrator"?"Administrator":"Unit User"}</span></div>
         </header>
         <div className="content">
-          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} goRecords={()=>setPage("records")} goRetirees={()=>setPage("retirees")} displayName={profile.displayName} unit={profile.unit}/>}
+          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
           {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
-          {page==="retirees" && <RetireesPage role={role} profile={profile} notify={notify}/>}
+          {page==="retirees" && <RetireesPage title="Compulsory Retirees" collectionName="retirees" initialData={retireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
+          {page==="optional_retirees" && <RetireesPage title="Optional Retirees" collectionName="optionalRetirees" initialData={optionalRetireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="compliance" && <CompliancePage claims={scopedClaims} retirees={scopedRetirees} profile={profile} role={role} notify={notify}/>}
           {page==="reconcile" && role==="administrator" && <ReconciliationPage claims={claims} retirees={retirees} notify={notify}/>}
           {page==="announcements" && <AnnouncementsPage profile={profile} role={role} notify={notify}/>}
@@ -377,7 +402,7 @@ export default function Home() {
   );
 }
 
-function Dashboard({claims,retirees,goRecords,goRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];goRecords:()=>void;goRetirees:()=>void;displayName:string;unit:string}) {
+function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOptionalRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];optionalRetirees:Retiree[];goRecords:()=>void;goRetirees:()=>void;goOptionalRetirees:()=>void;displayName:string;unit:string}) {
   const [claimView,setClaimView]=useState("All");
   const [retireeView,setRetireeView]=useState("All");
   const hour=new Date().getHours();
@@ -397,7 +422,7 @@ function Dashboard({claims,retirees,goRecords,goRetirees,displayName,unit}:{clai
   const unassigned=retirees.filter(record=>!record.unit||record.unit==="Unassigned").length;
   const completionRate=visibleClaims.length?Math.round(complete/visibleClaims.length*100):0;
   return <div className="stack">
-    <section className="welcome compact-welcome"><div><p>{unit} Monitoring Overview</p><h3>{greeting}, {displayName}</h3><span>KIPO/WIPO claims and compulsory retirees at a glance.</span></div></section>
+    <section className="welcome compact-welcome"><div><p>{unit} Monitoring Overview</p><h3>{greeting}, {displayName}</h3><span>KIPO/WIPO claims, compulsory retirees, and optional retirees at a glance.</span></div></section>
     <section className="combined-dashboard">
       <article className="dashboard-module panel">
         <div className="module-heading"><div><span className="module-kicker">Personnel Claims</span><h3>KIPO/WIPO Dashboard</h3></div><div className="year-switch" aria-label="KIPO/WIPO year filter">{["All","2025","2026"].map(y=><button key={y} className={claimView===y?"active":""} onClick={()=>setClaimView(y)}>{y}</button>)}</div></div>
@@ -411,16 +436,21 @@ function Dashboard({claims,retirees,goRecords,goRetirees,displayName,unit}:{clai
         <button className="module-link" onClick={goRecords}>View KIPO/WIPO Records <span>→</span></button>
       </article>
       <article className="dashboard-module panel">
-        <div className="module-heading"><div><span className="module-kicker">Retirement Benefits</span><h3>Compulsory Retirees</h3></div><div className="year-switch" aria-label="Retirees year filter">{["All","2025","2026"].map(y=><button key={y} className={retireeView===y?"active":""} onClick={()=>setRetireeView(y)}>{y}</button>)}</div></div>
+        <div className="module-heading"><div><span className="module-kicker">Retirement Benefits</span><h3>Compulsory & Optional Retirees</h3></div><div className="year-switch" aria-label="Retirees year filter">{["All","2025","2026"].map(y=><button key={y} className={retireeView===y?"active":""} onClick={()=>setRetireeView(y)}>{y}</button>)}</div></div>
         <div className="retiree-main-metrics">
-          <div><span>Total No. of Compulsory Retirees</span><strong>{visibleRetirees.length}</strong></div>
-          <div className="processed"><span>Total CAL Processed</span><strong>{calProcessed(visibleRetirees)}</strong></div>
-          <div className="not-processed"><span>CAL Claimed Not Processed</span><strong>{calNotProcessed(visibleRetirees)}</strong></div>
+          <div><span>Total Retirees</span><strong>{visibleRetirees.length + optionalRetirees.length}</strong></div>
+          <div className="processed"><span>Compulsory</span><strong>{visibleRetirees.length}</strong></div>
+          <div className="processed"><span>Optional</span><strong>{optionalRetirees.length}</strong></div>
+          <div className="processed"><span>CAL Processed</span><strong>{visibleRetirees.filter(isCalProcessed).length}</strong></div>
+          <div className="processed"><span>Lump Sum Processed</span><strong>{visibleRetirees.filter(isLumpSumProcessed).length}</strong></div>
         </div>
         <div className="year-comparison">
-          {[2025,2026].map(year=>{const rows=retirees.filter(r=>r.year===year);return <div key={year}><b>{year}</b><span><strong>{rows.length}</strong> Retirees</span><span><strong>{calProcessed(rows)}</strong> Processed</span><span><strong>{calNotProcessed(rows)}</strong> Not Processed</span></div>})}
+          {[2025,2026].map(year=>{const rows=retirees.filter(r=>r.year===year);const calDone=rows.filter(isCalProcessed).length;const lumpDone=rows.filter(isLumpSumProcessed).length;return <div key={year}><b>CY {year}</b><span><strong>{rows.length}</strong> Compulsory</span><span><strong>{calDone}</strong> CAL Done</span><span><strong>{lumpDone}</strong> Lump Sum</span></div>;})}
         </div>
-        <button className="module-link" onClick={goRetirees}>View Compulsory Retirees <span>→</span></button>
+        <div style={{display:"flex",gap:"10px",marginTop:"12px"}}>
+          <button className="module-link" style={{flex:1}} onClick={goRetirees}>Compulsory Retirees <span>→</span></button>
+          <button className="module-link" style={{flex:1,background:"var(--panel2)",borderColor:"var(--line)"}} onClick={goOptionalRetirees}>Optional Retirees <span>→</span></button>
+        </div>
       </article>
     </section>
     <section className="dash-grid">
@@ -456,43 +486,162 @@ type Retiree = {
   id:string; year:number; rank:string; name:string; retirementDate:string; retirementDisplay:string;
   unit?:string; calRequirements:string; lumpSumRequirements:string; status:string; remarks:string; sourceCoverage:string;
   calStatus?:"Processed"|"Not Processed"; requirements?:Record<string,boolean>;
+  lumpSumStatus?:"Processed"|"Not Processed";
   lastUpdateDate?:string; nextFollowUpDate?:string; assignedFocalPerson?:string; latestAction?:string;
 };
-const isCalProcessed=(record:Retiree)=>record.calStatus?record.calStatus==="Processed":record.status==="Complete"||/\bcomplete(d)?\b/i.test(record.calRequirements);
+const isCalProcessed=(record:Retiree)=>record.calStatus?record.calStatus==="Processed":record.status==="Complete"||/\bcomplete(d)?\b/i.test(record.calRequirements||"");
+const isLumpSumProcessed=(record:Retiree)=>record.lumpSumStatus?record.lumpSumStatus==="Processed":record.status==="Complete"||/\b(complete(d)?|submitted|prbs|uploaded)\b/i.test(record.lumpSumRequirements||"")||/\blumpsum\b/i.test(record.remarks||"");
+
 const retireeRequirements=["CAL Folder","Lump Sum/Outright Folder","Service Record","Retirement Order","Latest Payslip","Clearances","Valid IDs","Bank Account Details"] as const;
 
 const retireeMonths=["January","February","March","April","May","June","July","August","September","October","November","December"];
 
-function RetireeMonthlyDashboard({records}:{records:Retiree[]}) {
-  const years=Array.from(new Set(records.map(record=>record.year))).sort();
-  return <section className="monthly-retiree-grid" aria-label="Monthly compulsory retirees dashboard">
-    {years.map(year=>{
-      const yearRecords=records.filter(record=>record.year===year);
-      const monthly=retireeMonths.map((month,index)=>{
-        const monthRecords=yearRecords.filter(record=>{
-          const date=new Date(`${record.retirementDate}T00:00:00`);
-          return !Number.isNaN(date.getTime())&&date.getMonth()===index;
-        });
-        const processed=monthRecords.filter(isCalProcessed).length;
-        return {month,total:monthRecords.length,processed,pending:monthRecords.length-processed};
-      });
-      const processed=monthly.reduce((sum,row)=>sum+row.processed,0);
-      return <article className="monthly-retiree panel" key={year}>
-        <header><h3>{year}</h3></header>
-        <div className="monthly-table-wrap"><table>
-          <thead><tr><th>Month</th><th>Total No. of Compulsory Retirees</th><th>CAL Claims Processed</th><th>CAL Claims Not Yet Processed</th></tr></thead>
-          <tbody>
-            {monthly.map(row=><tr key={row.month}><td>{row.month}</td><td>{row.total||"—"}</td><td>{row.processed||"—"}</td><td>{row.pending||"—"}</td></tr>)}
-            <tr className="monthly-total"><td>Total</td><td>{yearRecords.length}</td><td>{processed}</td><td>{yearRecords.length-processed}</td></tr>
-          </tbody>
-        </table></div>
-      </article>
-    })}
-  </section>
+function RetireeMonthlyDashboard({records, title="Compulsory Retirees"}:{records:Retiree[]; title?:string}) {
+  const availableYears=Array.from(new Set(records.map(record=>record.year))).sort((a,b)=>a-b);
+  const [selectedYear,setSelectedYear]=useState<number>(availableYears.includes(2025)?2025:availableYears[0]||2025);
+
+  const yearRecords=records.filter(record=>record.year===selectedYear);
+  const monthly=retireeMonths.map((month,index)=>{
+    const monthRecords=yearRecords.filter(record=>{
+      const date=new Date(`${record.retirementDate}T00:00:00`);
+      return !Number.isNaN(date.getTime())&&date.getMonth()===index;
+    });
+    const calDone=monthRecords.filter(isCalProcessed).length;
+    const lumpDone=monthRecords.filter(isLumpSumProcessed).length;
+    return {
+      month,
+      total:monthRecords.length,
+      calDone,
+      calPending:monthRecords.length-calDone,
+      lumpDone,
+      lumpPending:monthRecords.length-lumpDone
+    };
+  });
+  const totalMonthlyTotal=monthly.reduce((sum,row)=>sum+row.total,0);
+  const totalCalDone=monthly.reduce((sum,row)=>sum+row.calDone,0);
+  const totalCalPending=monthly.reduce((sum,row)=>sum+row.calPending,0);
+  const totalLumpDone=monthly.reduce((sum,row)=>sum+row.lumpDone,0);
+  const totalLumpPending=monthly.reduce((sum,row)=>sum+row.lumpPending,0);
+
+  const recapUnits=["Batangas PPO","Cavite PPO","Laguna PPO","Quezon PPO","Rizal PPO","RHQ","RMFB 4A"];
+  const recapRows=recapUnits.map(unit=>{
+    const unitRecords=yearRecords.filter(r=>sameUnit(r.unit,unit));
+    const calDone=unitRecords.filter(isCalProcessed).length;
+    const lumpDone=unitRecords.filter(isLumpSumProcessed).length;
+    return {
+      unit,
+      total:unitRecords.length,
+      calDone,
+      calPending:unitRecords.length-calDone,
+      lumpDone,
+      lumpPending:unitRecords.length-lumpDone
+    };
+  });
+  const totalRecapTotal=recapRows.reduce((sum,row)=>sum+row.total,0);
+  const totalRecapCalDone=recapRows.reduce((sum,row)=>sum+row.calDone,0);
+  const totalRecapCalPending=recapRows.reduce((sum,row)=>sum+row.calPending,0);
+  const totalRecapLumpDone=recapRows.reduce((sum,row)=>sum+row.lumpDone,0);
+  const totalRecapLumpPending=recapRows.reduce((sum,row)=>sum+row.lumpPending,0);
+
+  return (
+    <div className="stack">
+      <div className="panel" style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 22px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+          <span style={{fontSize:"11px",color:"#efc45d",textTransform:"uppercase",letterSpacing:".14em",fontWeight:800}}>{title}</span>
+          <h3 style={{margin:0,fontSize:"20px"}}>CY {selectedYear} Executive Summary</h3>
+        </div>
+        <div className="year-switch" aria-label="Select retirement year">
+          {availableYears.map(yr=>(
+            <button key={yr} className={selectedYear===yr?"active":""} onClick={()=>setSelectedYear(yr)}>
+              {yr}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <section className="monthly-retiree-grid" aria-label={`Monthly ${title.toLowerCase()} dashboard`}>
+        <article className="monthly-retiree panel">
+          <header><h3>Monthly Breakdown ({selectedYear})</h3></header>
+          <div className="monthly-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Month</th>
+                  <th>Total No. of {title}</th>
+                  <th>CAL Claims Processed</th>
+                  <th>CAL Claims Not Yet Processed</th>
+                  <th>Lump Sum Processed</th>
+                  <th>Lump Sum Not Processed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monthly.map(row=>(
+                  <tr key={row.month}>
+                    <td>{row.month}</td>
+                    <td>{row.total||"—"}</td>
+                    <td>{row.calDone||"—"}</td>
+                    <td>{row.calPending||"—"}</td>
+                    <td>{row.lumpDone||"—"}</td>
+                    <td>{row.lumpPending||"—"}</td>
+                  </tr>
+                ))}
+                <tr className="monthly-total">
+                  <td>Total</td>
+                  <td>{totalMonthlyTotal}</td>
+                  <td>{totalCalDone}</td>
+                  <td>{totalCalPending}</td>
+                  <td>{totalLumpDone}</td>
+                  <td>{totalLumpPending}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article className="monthly-retiree panel">
+          <header><h3>Recap by PPO and RHQ ({selectedYear})</h3></header>
+          <div className="monthly-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>PPO / RHQ Unit</th>
+                  <th>Total No. of {title}</th>
+                  <th>CAL Processed</th>
+                  <th>CAL Not Processed</th>
+                  <th>Lump Sum Processed</th>
+                  <th>Lump Sum Not Processed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recapRows.map(row=>(
+                  <tr key={row.unit}>
+                    <td style={{textAlign:"left",fontWeight:650}}>{row.unit}</td>
+                    <td>{row.total||"—"}</td>
+                    <td>{row.calDone||"—"}</td>
+                    <td>{row.calPending||"—"}</td>
+                    <td>{row.lumpDone||"—"}</td>
+                    <td>{row.lumpPending||"—"}</td>
+                  </tr>
+                ))}
+                <tr className="monthly-total">
+                  <td style={{textAlign:"left"}}>Total</td>
+                  <td>{totalRecapTotal}</td>
+                  <td>{totalRecapCalDone}</td>
+                  <td>{totalRecapCalPending}</td>
+                  <td>{totalRecapLumpDone}</td>
+                  <td>{totalRecapLumpPending}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </div>
+  );
 }
 
-function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notify:(message:string)=>void}) {
-  const [allRecords,setAllRecords]=useState<Retiree[]>(retireeRecords as Retiree[]);
+function RetireesPage({title="Compulsory Retirees",collectionName="retirees",initialData=retireeRecords as Retiree[],role,profile,notify}:{title?:string;collectionName?:string;initialData?:Retiree[];role:Role;profile:UserProfile;notify:(message:string)=>void}) {
+  const [allRecords,setAllRecords]=useState<Retiree[]>(initialData);
   const [query,setQuery]=useState("");
   const [year,setYear]=useState("All");
   const [status,setStatus]=useState("All");
@@ -500,13 +649,13 @@ function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notif
   useEffect(()=>{
     if(!db)return;
     const source=role==="administrator"
-      ? collection(db,"retirees")
-      : firestoreQuery(collection(db,"retirees"),where("unit","==",profile.unit));
+      ? collection(db,collectionName)
+      : firestoreQuery(collection(db,collectionName),where("unit","==",profile.unit));
     return onSnapshot(source,snapshot=>{
       const remote=snapshot.docs.map(item=>item.data() as Retiree);
       setAllRecords(remote);
-    },()=>notify("Unable to load retiree records from Firebase."));
-  },[notify,profile.unit,role]);
+    },()=>notify(`Unable to load ${title.toLowerCase()} records from Firebase.`));
+  },[notify,profile.unit,role,collectionName,title]);
   const scopedRecords=role==="administrator"?allRecords:allRecords.filter(record=>sameUnit(record.unit,profile.unit));
   const records=scopedRecords.filter(r=>{
     const text=`${r.id} ${r.rank} ${r.name} ${r.status} ${r.remarks}`.toLowerCase();
@@ -517,15 +666,15 @@ function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notif
   const exportRetirees=async()=>{
     try {
       await exportRetireesExcel(records);
-      notify(`${records.length} retiree records exported in the official Excel format.`);
+      notify(`${records.length} ${title.toLowerCase()} records exported in official Excel format.`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "Excel export failed.");
     }
   };
   const statuses=["All",...Array.from(new Set(scopedRecords.map(r=>r.status)))];
   const saveRetiree=async(record:Retiree)=>{
-    if(role==="unit_user"&&!sameUnit(record.unit,profile.unit)){notify("You can only save retirees for your assigned unit.");return;}
-    if(editing==="new"&&allRecords.some(existing=>existing.id.toLowerCase()===record.id.toLowerCase())){notify("Retiree ID already exists. Use a unique ID.");return;}
+    if(role==="unit_user"&&!sameUnit(record.unit,profile.unit)){notify(`You can only save ${title.toLowerCase()} records for your assigned unit.`);return;}
+    if(editing==="new"&&allRecords.some(existing=>existing.id.toLowerCase()===record.id.toLowerCase())){notify("ID already exists. Use a unique ID.");return;}
     const sanitizedRecord = sanitizeRecord({
       ...record,
       unit: record.unit || profile.unit || "RHQ",
@@ -534,11 +683,11 @@ function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notif
     try {
       if(db&&auth?.currentUser){
         const batch=writeBatch(db);
-        batch.set(doc(db,"retirees",sanitizedRecord.id),sanitizedRecord);
+        batch.set(doc(db,collectionName,sanitizedRecord.id),sanitizedRecord);
         batch.set(doc(collection(db,"activityHistory")),{
-          action:editing==="new"?"Retiree created":"Retiree updated",
+          action:editing==="new"?`${title} created`:`${title} updated`,
           details:`${sanitizedRecord.rank} ${sanitizedRecord.name}`,
-          recordType:"retiree",
+          recordType:collectionName,
           recordId:sanitizedRecord.id,
           unit:sanitizedRecord.unit || profile.unit,
           actorUid:auth.currentUser.uid,
@@ -551,52 +700,53 @@ function RetireesPage({role,profile,notify}:{role:Role;profile:UserProfile;notif
         await batch.commit();
       }
     } catch (error) {
-      console.error("Retiree save error:", error);
-      void recordSystemError("Retiree save failed", error);
+      console.error("Save error:", error);
+      void recordSystemError(`${title} save failed`, error);
       notify("Save failed. Check network or security permissions.");
       return;
     }
     setAllRecords(previous=>previous.some(r=>r.id===sanitizedRecord.id)?previous.map(r=>r.id===sanitizedRecord.id?sanitizedRecord:r):[sanitizedRecord,...previous]);
     setEditing(null);
-    notify(firebaseConfigured ? "Retiree record saved and synced to Firebase." : "Retiree record saved.");
+    notify(firebaseConfigured ? `${title} record saved and synced to Firebase.` : `${title} record saved.`);
   };
   const removeRetiree=async(id:string)=>{
-    if(role!=="administrator"||!db||!auth?.currentUser){notify("Only administrators can archive retiree records.");return;}
+    if(role!=="administrator"||!db||!auth?.currentUser){notify("Only administrators can archive records.");return;}
     const record=allRecords.find(r=>r.id===id);if(!record)return;
-    const reason=prompt("Reason for archiving this retiree record:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}
-    try {const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"retirees",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:auth.currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"retirees",id));batch.set(doc(collection(db,"activityHistory")),{action:"Retiree archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"retiree",recordId:id,unit:record.unit,actorUid:auth.currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();} catch { notify("Archive failed. No record was removed."); return; }
-    setAllRecords(previous=>previous.filter(r=>r.id!==id)); notify("Retiree record archived and recoverable.");
+    const reason=prompt(`Reason for archiving this ${title.toLowerCase()} record:`)?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}
+    try {const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:collectionName,sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:auth.currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,collectionName,id));batch.set(doc(collection(db,"activityHistory")),{action:`${title} archived`,details:`${record.rank} ${record.name} • ${reason}`,recordType:collectionName,recordId:id,unit:record.unit,actorUid:auth.currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();} catch { notify("Archive failed. No record was removed."); return; }
+    setAllRecords(previous=>previous.filter(r=>r.id!==id)); notify(`${title} record archived and recoverable.`);
   };
+  const yearOptions = ["All", ...Array.from(new Set(scopedRecords.map(r => String(r.year)))).sort()];
   return <div className="stack">
-    <RetireeMonthlyDashboard records={scopedRecords}/>
+    <RetireeMonthlyDashboard records={scopedRecords} title={title}/>
     <section className="retiree-summary">
-      <article><span>Total Retirees</span><strong>{scopedRecords.length}</strong><small>{role==="administrator"?"All PRO 4A units":profile.unit}</small></article>
-      <article><span>CY 2025</span><strong>{scopedRecords.filter(r=>r.year===2025).length}</strong><small>Compulsory retirees</small></article>
-      <article><span>CY 2026</span><strong>{scopedRecords.filter(r=>r.year===2026).length}</strong><small>As of July 15, 2026</small></article>
+      <article><span>Total {title}</span><strong>{scopedRecords.length}</strong><small>{role==="administrator"?"All PRO 4A units":profile.unit}</small></article>
+      <article><span>CY 2025</span><strong>{scopedRecords.filter(r=>r.year===2025).length}</strong><small>{title}</small></article>
+      <article><span>CY 2026</span><strong>{scopedRecords.filter(r=>r.year===2026).length}</strong><small>Monitoring</small></article>
       <article><span>Complete</span><strong>{scopedRecords.filter(r=>r.status==="Complete").length}</strong><small>Requirements processed</small></article>
       <article><span>For Action</span><strong>{scopedRecords.filter(r=>r.status!=="Complete").length}</strong><small>Requires monitoring</small></article>
     </section>
     <section className="toolbar panel">
       <div className="search"><Search/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search name, status or remarks..."/></div>
-      <Select value={year} change={setYear} options={["All","2025","2026"]}/>
+      <Select value={year} change={setYear} options={yearOptions.length > 1 ? yearOptions : ["All","2025","2026","2027"]}/>
       <Select value={status} change={setStatus} options={statuses}/>
       <button className="outline" onClick={exportRetirees}><Download/>Export Excel</button>
-      <button className="primary" onClick={()=>setEditing("new")}><Plus/>Add Retiree</button>
+      <button className="primary" onClick={()=>setEditing("new")}><Plus/>Add {title.replace(/s$/i,"")}</button>
     </section>
     <section className="panel registry">
-      <PanelHead title="Compulsory Retirees Registry" copy={`${records.length} records • CY 2025 and CY 2026 monitoring`}/>
+      <PanelHead title={`${title} Registry`} copy={`${records.length} records • Multi-year monitoring`}/>
       <div className="table-wrap"><table className="retiree-table"><thead><tr><th>Rank / Name</th><th>Date of Retirement</th><th>CAL Requirements</th><th>Lump Sum</th><th>Status</th><th>Remarks</th><th>Actions</th></tr></thead>
       <tbody>{records.map(r=><tr key={r.id}><td><strong>{r.rank} {r.name}</strong><small>{r.unit||"Unit not assigned"}</small></td><td><strong>{r.retirementDisplay}</strong><small>CY {r.year}</small></td><td>{r.calRequirements}</td><td>{r.lumpSumRequirements}</td><td><span className={`status ${r.status==="Complete"?"completed":r.status==="Pending Clearance"?"pending":"in-process"}`}>{r.status}</span></td><td className="remarks-cell">{r.remarks}</td><td><div className="actions"><button className="edit" title="Update" aria-label={`Update record of ${r.rank} ${r.name}`} onClick={()=>setEditing(r)}><Pencil/></button>{role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${r.rank} ${r.name}`} onClick={()=>removeRetiree(r.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!records.length&&<div className="empty">No records are assigned to {profile.unit}.</div>}</div>
     </section>
-    {editing&&<RetireeModal retiree={editing==="new"?null:editing} role={role} assignedUnit={profile.unit} close={()=>setEditing(null)} save={saveRetiree}/>}
+    {editing&&<RetireeModal title={title} retiree={editing==="new"?null:editing} role={role} assignedUnit={profile.unit} close={()=>setEditing(null)} save={saveRetiree}/>}
   </div>
 }
 
-function RetireeModal({retiree,role,assignedUnit,close,save}:{retiree:Retiree|null;role:Role;assignedUnit:string;close:()=>void;save:(record:Retiree)=>void}) {
-  const [data,setData]=useState<Retiree>(()=>{const now=new Date(),today=now.toISOString().slice(0,10),currentYear=now.getFullYear();return retiree??{id:`RET-${currentYear}-${String(now.getTime()).slice(-3)}`,year:currentYear,rank:"",name:"",unit:role==="unit_user"?assignedUnit:"",retirementDate:today,retirementDisplay:new Date(today+"T00:00:00").toLocaleDateString("en-US",{month:"long",day:"2-digit",year:"numeric"}),calRequirements:"Pending",lumpSumRequirements:"Pending",status:"Pending Clearance",calStatus:"Not Processed",requirements:{},lastUpdateDate:today,remarks:"",sourceCoverage:`CY ${currentYear}`}});
+function RetireeModal({title="Compulsory Retiree",retiree,role,assignedUnit,close,save}:{title?:string;retiree:Retiree|null;role:Role;assignedUnit:string;close:()=>void;save:(record:Retiree)=>void}) {
+  const [data,setData]=useState<Retiree>(()=>{const now=new Date(),today=now.toISOString().slice(0,10),currentYear=now.getFullYear(),prefix=title.toLowerCase().includes("optional")?"OPT":"RET";return retiree??{id:`${prefix}-${currentYear}-${String(now.getTime()).slice(-3)}`,year:currentYear,rank:"",name:"",unit:role==="unit_user"?assignedUnit:"",retirementDate:today,retirementDisplay:new Date(today+"T00:00:00").toLocaleDateString("en-US",{month:"long",day:"2-digit",year:"numeric"}),calRequirements:"Pending",lumpSumRequirements:"Pending",status:"Pending Clearance",calStatus:"Not Processed",requirements:{},lastUpdateDate:today,remarks:"",sourceCoverage:`CY ${currentYear}`}});
   const field=(key:keyof Retiree,value:string|number)=>setData(current=>({...current,[key]:value}));
   const setDate=(value:string)=>setData(current=>({...current,retirementDate:value,year:Number(value.slice(0,4)),sourceCoverage:`CY ${value.slice(0,4)}`,retirementDisplay:new Date(value+"T00:00:00").toLocaleDateString("en-US",{month:"long",day:"2-digit",year:"numeric"})}));
-  return <div className="modal-bg" onMouseDown={e=>e.target===e.currentTarget&&close()}><form className="modal panel" onSubmit={e=>{e.preventDefault();save(data)}}><div className="modal-head"><div><p>Compulsory Retiree</p><h3>{retiree?"Update retiree record":"Add retiree record"}</h3></div><button type="button" onClick={close}><X/></button></div><div className="form-grid">
+  return <div className="modal-bg" onMouseDown={e=>e.target===e.currentTarget&&close()}><form className="modal panel" onSubmit={e=>{e.preventDefault();save(data)}}><div className="modal-head"><div><p>{title}</p><h3>{retiree?`Update ${title.toLowerCase().replace(/s$/i,"")} record`:`Add ${title.toLowerCase().replace(/s$/i,"")} record`}</h3></div><button type="button" onClick={close}><X/></button></div><div className="form-grid">
     <input type="hidden" value={data.id}/><label>Date of Retirement<input required type="date" value={data.retirementDate} onChange={e=>setDate(e.target.value)}/></label>
     <label>Rank<input required value={data.rank} onChange={e=>field("rank",e.target.value)}/></label><label>Full Name<input required value={data.name} onChange={e=>field("name",e.target.value)}/></label>
     <label>Unit / Office<select required disabled={role==="unit_user"} value={data.unit||""} onChange={e=>field("unit",e.target.value)}><option value="">Select unit</option>{operationalUnits.map(x=><option key={x}>{x}</option>)}</select></label>
@@ -631,7 +781,7 @@ function ClaimModal({claim,readOnly,role,assignedUnit,close,save}:{claim:Claim|n
   </div><section className="requirements-section"><div className="benefits-heading"><div><p>Documentary Requirements</p><strong>{Object.values(data.requirements||{}).filter(Boolean).length} of {claimRequirements.length} complete</strong></div><small>Check only documents already verified.</small></div><div className="requirements-checklist">{claimRequirements.map(item=><label key={item}><input type="checkbox" checked={Boolean(data.requirements?.[item])} onChange={e=>setData(current=>({...current,requirements:{...(current.requirements||{}),[item]:e.target.checked}}))}/><span>{item}</span></label>)}</div></section><section className="benefits-section"><div className="benefits-heading"><div><p>Claims and Benefits</p><strong>Benefits monitoring</strong></div><small>{readOnly?"Current recorded status":"Enter the status, amount, date, or remarks for each applicable benefit."}</small></div><div className="benefits-matrix">{benefitGroups.map(group=><article className={`benefit-group ${group.items.length===1?"compact":""}`} key={group.title}><h4>{group.title}</h4><div>{group.items.map(([key,label])=><label key={key}><span>{label}</span><textarea rows={2} placeholder={readOnly?"No entry recorded":"Enter status or remarks"} value={benefitValue(key)} onChange={e=>benefit(key,e.target.value)}/></label>)}</div></article>)}</div></section><div className="workflow"><strong>Workflow progress</strong><div>{["Incident Recorded","Document Completion","RHE Board Review","OP Validation","Benefits Released"].map((x,i)=>{const current=workflowStages.indexOf(normalizeWorkflow(data.stage) as typeof workflowStages[number]);const target=workflowStages.indexOf(x as typeof workflowStages[number]);const done=current>=target;return <span className={done?"done":""} key={x}><b>{done?"✓":i+1}</b>{x.replace(" Recorded","").replace(" Completion","").replace("RHE ","").replace("OP ","")}</span>})}</div></div></fieldset><div className="modal-actions"><button type="button" className="outline" onClick={close}>{readOnly?"Close":"Cancel"}</button>{!readOnly&&<button className="primary">Save Record</button>}</div></form></div>
 }
 
-type ImportKind="claims"|"retirees";
+type ImportKind="claims"|"retirees"|"optionalRetirees";
 type ImportPreview={row:number;id:string;valid:boolean;duplicate:boolean;errors:string[];record:Claim|Retiree};
 const cleanHeader=(value:string)=>value.trim().toLowerCase().replace(/[^a-z0-9]+/g,"");
 const readCell=(row:Record<string,unknown>,aliases:string[])=>{
@@ -785,10 +935,14 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
       : ["Retiree ID","Year","Rank","Name","Unit","Date of Retirement","CAL Requirements","Lump Sum Requirements","Status","Remarks","Source Coverage"];
     const example=kind==="claims"
       ? ["WIPO-2026-001","WIPO",2026,"PCpl","JUAN D. DELA CRUZ","Cavite PPO","Cavite PMFC","2026-07-15","Document Completion","In Process","Sample injury","As of July 2026"]
-      : ["RET-2026-001",2026,"PMSg","JUAN D. DELA CRUZ","Cavite PPO","2026-10-15","COMPLETE","Pending","Pending Clearance","Sample remarks","CY 2026"];
+      : kind==="optionalRetirees"
+      ? ["OPT-2026-001",2026,"PMSg","JUAN D. DELA CRUZ","Cavite PPO","2026-10-15","COMPLETE","Pending","Pending Clearance","Sample optional remarks","CY 2026"]
+      : ["RET-2026-001",2026,"PMSg","JUAN D. DELA CRUZ","Cavite PPO","2026-10-15","COMPLETE","Pending","Pending Clearance","Sample compulsory remarks","CY 2026"];
     const workbook=XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook,XLSX.utils.aoa_to_sheet([headers,example]),kind==="claims"?"KIPO-WIPO":"Retirees");
-    XLSX.writeFile(workbook,kind==="claims"?"PRO4A-KIPO-WIPO-Import-Template.xlsx":"PRO4A-Retirees-Import-Template.xlsx");
+    const sheetName=kind==="claims"?"KIPO-WIPO":kind==="optionalRetirees"?"Optional-Retirees":"Compulsory-Retirees";
+    const templateName=kind==="claims"?"PRO4A-KIPO-WIPO-Import-Template.xlsx":kind==="optionalRetirees"?"PRO4A-Optional-Retirees-Import-Template.xlsx":"PRO4A-Compulsory-Retirees-Import-Template.xlsx";
+    XLSX.utils.book_append_sheet(workbook,XLSX.utils.aoa_to_sheet([headers,example]),sheetName);
+    XLSX.writeFile(workbook,templateName);
     notify("Import template downloaded.");
   };
   const parseFile=async(file:File)=>{
@@ -798,7 +952,10 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
       const workbook=XLSX.read(await file.arrayBuffer(),{type:"array",cellDates:true});
       const fileText = `${file.name} ${workbook.SheetNames.join(" ")}`.toLowerCase();
       let activeKind: ImportKind = kind;
-      if (/retiree|compulsory|cal\b/i.test(fileText) && !/kipo|wipo/i.test(fileText)) {
+      if (/optional/i.test(fileText)) {
+        activeKind = "optionalRetirees";
+        setKind("optionalRetirees");
+      } else if (/retiree|compulsory|cal\b/i.test(fileText) && !/kipo|wipo/i.test(fileText)) {
         activeKind = "retirees";
         setKind("retirees");
       } else if (/kipo|wipo/i.test(fileText)) {
@@ -813,7 +970,7 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
         const fileYear=file.name.match(/20\d{2}/)?.[0]||"";
         const sheetYear=name.match(/20\d{2}/)?.[0]||"";
         const headingYear=heading.match(/20\d{2}/)?.[0]||"";
-        const expectedKind=activeKind==="retirees"?/COMPULSORY|RETIREE|CAL/.test(`${name} ${heading}`):/\b(KIPO|WIPO)\b/.test(`${name} ${heading}`);
+        const expectedKind=activeKind==="claims"?/\b(KIPO|WIPO)\b/.test(`${name} ${heading}`):activeKind==="optionalRetirees"?/OPTIONAL/.test(`${name} ${heading}`):/COMPULSORY|RETIREE|CAL/.test(`${name} ${heading}`);
         const yearMatch=Boolean(fileYear&&(sheetYear===fileYear||headingYear===fileYear));
         return {sheet,matrix,index,score:(expectedKind?20:0)+(yearMatch?20:0)+(sheetYear===fileYear?5:0)};
       }).sort((a,b)=>b.score-a.score||a.index-b.index)[0];
@@ -839,8 +996,13 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
           existingIds.add(c.id.toLowerCase());
           existingPersonnel.add(personnelKey(c.rank,c.name,c.province,c.date));
         });
-      } else {
+      } else if (activeKind === "retirees") {
         (retireeRecords as Retiree[]).forEach(r => {
+          existingIds.add(r.id.toLowerCase());
+          existingPersonnel.add(personnelKey(r.rank,r.name,r.unit||"",r.retirementDate));
+        });
+      } else {
+        (optionalRetireeRecords as Retiree[]).forEach(r => {
           existingIds.add(r.id.toLowerCase());
           existingPersonnel.add(personnelKey(r.rank,r.name,r.unit||"",r.retirementDate));
         });
@@ -904,7 +1066,8 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
         const parsedPerson=splitRankName(rawName);
         const rank=(rawRank||parsedPerson.rank||"PNP").toUpperCase();
         const name=(parsedPerson.name||rawName).toUpperCase();
-        const id=(rawId||`RET-${year}-${String(index+1).padStart(3,"0")}`).toUpperCase();
+        const prefix=activeKind==="optionalRetirees"?"OPT":"RET";
+        const id=(rawId||`${prefix}-${year}-${String(index+1).padStart(3,"0")}`).toUpperCase();
         const calRequirements=readCell(row,["CAL Requirements","CAL","CAL Status"])||"Pending";
         const lumpSumRequirements=readCell(row,["Lump Sum Requirements","Lump Sum","Lump Sum Status"])||"Pending";
         const rawStatus=readCell(row,["Status","Retirement Status","State"]);
@@ -932,13 +1095,14 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
     if(!db||!validRows.length)return;
     if(validRows.length>450){notify("For safety, import a maximum of 450 records at one time. No records were written.");return;}
     const action=replaceDuplicates?"create new records and update matching IDs":"create new records and skip matching IDs";
-    if(!confirm(`Import ${validRows.length} validated ${kind==="claims"?"KIPO/WIPO":"retiree"} records?\n\nThis will ${action}.`))return;
+    const labelText=kind==="claims"?"KIPO/WIPO":kind==="optionalRetirees"?"optional retiree":"compulsory retiree";
+    if(!confirm(`Import ${validRows.length} validated ${labelText} records?\n\nThis will ${action}.`))return;
     setBusy(true);
     try{
       const batch=writeBatch(db);
       validRows.forEach(item=>batch.set(doc(db!,kind,item.id),item.record));
       if(auth?.currentUser)batch.set(doc(collection(db,"activityHistory")),{
-        action:"Bulk data imported",details:`${validRows.length} ${kind==="claims"?"KIPO/WIPO":"retiree"} records • ${fileName} • ${replaceDuplicates?"duplicates updated":"duplicates skipped"}`,
+        action:"Bulk data imported",details:`${validRows.length} ${labelText} records • ${fileName} • ${replaceDuplicates?"duplicates updated":"duplicates skipped"}`,
         recordType:"import",recordId:kind,unit:profile.unit,actorUid:auth.currentUser.uid,
         actorName:profile.displayName,actorRole:profile.role,newValue:{fileName,count:validRows.length,replaceDuplicates},createdAt:serverTimestamp()
       });
@@ -953,7 +1117,7 @@ function ImportPage({profile,notify,logActivity}:{profile:UserProfile;notify:(s:
     <section className="panel import-panel">
       <div className="import-steps"><div className="active"><b>1</b><span>Select data</span></div><div className={rows.length?"active":""}><b>2</b><span>Review validation</span></div><div><b>3</b><span>Confirm import</span></div></div>
       <div className="import-controls">
-        <label>Data type<select value={kind} onChange={e=>{setKind(e.target.value as ImportKind);reset()}}><option value="claims">KIPO/WIPO Records</option><option value="retirees">Compulsory Retirees</option></select></label>
+        <label>Data type<select value={kind} onChange={e=>{setKind(e.target.value as ImportKind);reset()}}><option value="claims">KIPO/WIPO Records</option><option value="retirees">Compulsory Retirees</option><option value="optionalRetirees">Optional Retirees</option></select></label>
         <button className="outline" onClick={downloadTemplate}><Download/>Download Template</button>
       </div>
       <label className="drop-zone">
@@ -1005,18 +1169,27 @@ function UsersPage({notify,profile,currentUser}:{notify:(s:string)=>void;profile
     if(!db)return;
     setSeeding(true);
     try{
-      const [claimSnapshot,retireeSnapshot]=await Promise.all([getDocs(collection(db,"claims")),getDocs(collection(db,"retirees"))]);
+      const [claimSnapshot,retireeSnapshot,optionalSnapshot]=await Promise.all([
+        getDocs(collection(db,"claims")),
+        getDocs(collection(db,"retirees")),
+        getDocs(collection(db,"optionalRetirees"))
+      ]);
       const claimIds=new Set(claimSnapshot.docs.map(item=>item.id));
       const retireeIds=new Set(retireeSnapshot.docs.map(item=>item.id));
+      const optionalIds=new Set(optionalSnapshot.docs.map(item=>item.id));
       const missingClaims=seedClaims.filter(record=>!claimIds.has(record.id));
       const missingRetirees=retireeRecords.filter(record=>!retireeIds.has(record.id));
-      if(!missingClaims.length&&!missingRetirees.length){notify("Official registry is already initialized. No records were changed.");return;}
-      if(!confirm(`Safe initialization preview:\n\n${missingClaims.length} new KIPO/WIPO records\n${missingRetirees.length} new retiree records\n${seedClaims.length-missingClaims.length+retireeRecords.length-missingRetirees.length} existing records preserved\n\nContinue without overwriting existing data?`))return;
+      const legacyOptional=optionalSnapshot.docs.filter(item=>item.id.startsWith("OPT-2025-"));
+      const missingOptional=optionalRetireeRecords.filter(record=>!optionalIds.has(record.id));
+      if(!missingClaims.length&&!missingRetirees.length&&!missingOptional.length&&!legacyOptional.length){notify("Official registry is already initialized. No records were changed.");return;}
+      if(!confirm(`Safe initialization preview:\n\n${missingClaims.length} new KIPO/WIPO records\n${missingRetirees.length} new compulsory retiree records\n${missingOptional.length} new optional retiree records\n${legacyOptional.length} legacy sample records to clean up\n\nContinue?`))return;
       const batch=writeBatch(db);
       missingClaims.forEach(record=>batch.set(doc(db!,"claims",record.id),record));
       missingRetirees.forEach(record=>batch.set(doc(db!,"retirees",record.id),record));
+      legacyOptional.forEach(docItem=>batch.delete(docItem.ref));
+      missingOptional.forEach(record=>batch.set(doc(db!,"optionalRetirees",record.id),record));
       await batch.commit();
-      notify(`Safe initialization complete: ${missingClaims.length+missingRetirees.length} new records; existing records preserved.`);
+      notify(`Safe initialization complete: ${missingClaims.length+missingRetirees.length+missingOptional.length} records synchronized.`);
     }catch{notify("Upload failed. Confirm the administrator role and Firestore rules.");}
     finally{setSeeding(false);}
   };
