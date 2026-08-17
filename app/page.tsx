@@ -38,7 +38,6 @@ const claimStatuses=["Pending","In Process","For Review","Completed","Not Qualif
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
-  if(/out\s*-?\s*patient/.test(text))return "Out Patient";
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
   if(/out[\s-]*patient|outpatient/.test(text))return "Out Patient";
@@ -149,7 +148,7 @@ export default function Home() {
 
   useEffect(()=>{
     try {
-      setOutPatientMigrationAvailable(localStorage.getItem("pro4a-outpatient-migration-v2")==="done" ? false : true);
+      setOutPatientMigrationAvailable(localStorage.getItem("pro4a-validation-for-review-migration-v1")==="done" ? false : true);
     } catch {
       setOutPatientMigrationAvailable(true);
     }
@@ -268,48 +267,62 @@ export default function Home() {
     await batch.commit();
   };
   const migrateOutPatientRecords=async()=>{
-    if(role!=="administrator"||!db||!currentUser){notify("Only administrators can update all Out Patient records.");return;}
+    if(role!=="administrator"||!db||!currentUser){
+      notify("Only administrators can update these records.");
+      return;
+    }
     if(outPatientMigrationBusy)return;
-    if(!confirm("Update all existing KIPO/WIPO records containing Out Patient in Workflow Stage or Claims & Benefits?\\n\\nThey will be saved as Workflow Stage: Out Patient and Status: Not Qualified. Continue?"))return;
+    if(!confirm("Update ALL records where Workflow is Validation and Status is For Review?\\n\\nThese records will be changed to:\\nWorkflow Stage: Out Patient\\nStatus: Not Qualified\\n\\nContinue?"))return;
+
     setOutPatientMigrationBusy(true);
     try{
       const snapshot=await getDocs(collection(db,"claims"));
+
       const targets=snapshot.docs.filter(item=>{
         const record=item.data() as Claim;
-        const stageText=String(record.stage||"");
-        const benefitText=Object.values(record.benefits||{}).map(value=>String(value||"")).join(" ");
-        return /out\\s*-?\\s*patient/i.test(stageText) || /out\\s*-?\\s*patient/i.test(benefitText);
+        const workflow=String(record.stage||"").trim().toLowerCase();
+        const status=String(record.status||"").trim().toLowerCase();
+
+        const isValidationWorkflow =
+          workflow==="validation" ||
+          workflow.includes("validation");
+
+        const isForReviewStatus =
+          status==="for review";
+
+        return isValidationWorkflow && isForReviewStatus;
       });
+
       if(!targets.length){
-        notify("No Out Patient records were found.");
+        notify("No records with Workflow = Validation and Status = For Review were found.");
         return;
       }
+
       const chunkSize=450;
+
       for(let start=0;start<targets.length;start+=chunkSize){
         const batch=writeBatch(db);
+
         targets.slice(start,start+chunkSize).forEach(item=>{
-          const record=item.data() as Claim;
-          const benefits=Object.fromEntries(
-            Object.entries(record.benefits||{}).map(([key,value])=>[
-              key,
-              /out\\s*-?\\s*patient/i.test(String(value||"")) ? "Out Patient" : value
-            ])
+          batch.set(
+            doc(db,"claims",item.id),
+            {
+              stage:"Out Patient",
+              status:"Not Qualified",
+              lastUpdateDate:isoToday()
+            },
+            {merge:true}
           );
-          batch.set(doc(db,"claims",item.id),{
-            ...record,
-            benefits,
-            stage:"Out Patient",
-            status:"Not Qualified",
-            lastUpdateDate:isoToday()
-          },{merge:true});
         });
+
         await batch.commit();
       }
+
       await addDoc(collection(db,"activityHistory"),{
-        action:"Out Patient records migrated",
-        details:`${targets.length} existing KIPO/WIPO records updated from Out Patient entries in Workflow Stage or Claims & Benefits`,
+        action:"Validation / For Review records migrated to Out Patient",
+        details:`${targets.length} records with Workflow Validation and Status For Review were updated to Out Patient / Not Qualified`,
         recordType:"claim",
-        recordId:"out-patient-migration",
+        recordId:"validation-for-review-migration",
         unit:profile.unit,
         actorUid:currentUser.uid,
         actorName:profile.displayName,
@@ -317,23 +330,30 @@ export default function Home() {
         updatedCount:targets.length,
         createdAt:serverTimestamp()
       });
+
       setClaims(previous=>previous.map(record=>{
-        const matched=targets.some(item=>item.id===record.id);
-        if(!matched)return record;
-        const benefits=Object.fromEntries(
-          Object.entries(record.benefits||{}).map(([key,value])=>[
-            key,
-            /out\\s*-?\\s*patient/i.test(String(value||"")) ? "Out Patient" : value
-          ])
-        );
-        return {...record,benefits,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()};
+        const workflow=String(record.stage||"").trim().toLowerCase();
+        const status=String(record.status||"").trim().toLowerCase();
+
+        const matched =
+          (workflow==="validation" || workflow.includes("validation")) &&
+          status==="for review";
+
+        return matched
+          ? {...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}
+          : record;
       }));
-      try{localStorage.setItem("pro4a-outpatient-migration-v2","done")}catch{}
+
+      try{
+        localStorage.setItem("pro4a-validation-for-review-migration-v1","done");
+      }catch{}
+
       setOutPatientMigrationAvailable(false);
-      notify(`${targets.length} Out Patient records updated in Firebase. The migration tool has been removed.`);
+
+      notify(`${targets.length} records updated in Firebase: Validation / For Review → Out Patient / Not Qualified.`);
     }catch(error){
-      void recordSystemError("Out Patient migration failed",error);
-      notify(error instanceof Error?error.message:"Out Patient update failed. No records were changed by the migration.");
+      void recordSystemError("Validation / For Review migration failed",error);
+      notify(error instanceof Error?error.message:"Update failed. No migration tool was removed.");
     }finally{
       setOutPatientMigrationBusy(false);
     }
@@ -561,7 +581,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
     }catch{p.notify("Bulk update failed. No partial changes were written.");}
   };
   return <div className="stack">
-    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" style={{borderColor:"#efc45d",color:"#efc45d"}} disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Out Patient Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
+    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Validation / For Review Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
     {selected.length>0&&<section className="panel bulk-bar"><strong>{selected.length} selected {selected.length>400&&<small className="validation-error">Maximum 400</small>}</strong><label>Next follow-up<input type="date" value={bulkDate} onChange={e=>setBulkDate(e.target.value)}/></label><label>Action taken<input value={bulkAction} onChange={e=>setBulkAction(e.target.value)} placeholder="Enter common action taken"/></label><button className="primary" disabled={selected.length>400} onClick={bulkUpdate}><Send/>Apply Update</button><button className="outline" onClick={()=>setSelected([])}>Clear</button></section>}
     <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
