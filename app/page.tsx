@@ -143,16 +143,7 @@ export default function Home() {
   const [modal, setModal] = useState<ClaimModalState | null>(null);
   const [toast, setToast] = useState("");
   const [lastSyncAt,setLastSyncAt]=useState<Date|null>(null);
-  const [outPatientMigrationAvailable,setOutPatientMigrationAvailable]=useState(true);
-  const [outPatientMigrationBusy,setOutPatientMigrationBusy]=useState(false);
 
-  useEffect(()=>{
-    try {
-      setOutPatientMigrationAvailable(localStorage.getItem("pro4a-validation-for-review-migration-v1")==="done" ? false : true);
-    } catch {
-      setOutPatientMigrationAvailable(true);
-    }
-  },[]);
   const recordSystemError=async(context:string,error:unknown)=>{
     if(!db||!currentUser||!profile)return;
     try{await addDoc(collection(db,"systemErrors"),{
@@ -265,98 +256,6 @@ export default function Home() {
       oldValue:claims.find(item=>item.id===claim.id)||null,newValue:claim,createdAt:serverTimestamp()
     });
     await batch.commit();
-  };
-  const migrateOutPatientRecords=async()=>{
-    if(role!=="administrator"||!db||!currentUser){
-      notify("Only administrators can update these records.");
-      return;
-    }
-    if(outPatientMigrationBusy)return;
-    if(!confirm("Update ALL records where Workflow is Validation and Status is For Review?\\n\\nThese records will be changed to:\\nWorkflow Stage: Out Patient\\nStatus: Not Qualified\\n\\nContinue?"))return;
-
-    setOutPatientMigrationBusy(true);
-    try{
-      const snapshot=await getDocs(collection(db,"claims"));
-
-      const targets=snapshot.docs.filter(item=>{
-        const record=item.data() as Claim;
-        const workflow=String(record.stage||"").trim().toLowerCase();
-        const status=String(record.status||"").trim().toLowerCase();
-
-        const isValidationWorkflow =
-          workflow==="validation" ||
-          workflow.includes("validation");
-
-        const isForReviewStatus =
-          status==="for review";
-
-        return isValidationWorkflow && isForReviewStatus;
-      });
-
-      if(!targets.length){
-        notify("No records with Workflow = Validation and Status = For Review were found.");
-        return;
-      }
-
-      const chunkSize=450;
-
-      for(let start=0;start<targets.length;start+=chunkSize){
-        const batch=writeBatch(db);
-
-        targets.slice(start,start+chunkSize).forEach(item=>{
-          batch.set(
-            doc(db,"claims",item.id),
-            {
-              stage:"Out Patient",
-              status:"Not Qualified",
-              lastUpdateDate:isoToday()
-            },
-            {merge:true}
-          );
-        });
-
-        await batch.commit();
-      }
-
-      await addDoc(collection(db,"activityHistory"),{
-        action:"Validation / For Review records migrated to Out Patient",
-        details:`${targets.length} records with Workflow Validation and Status For Review were updated to Out Patient / Not Qualified`,
-        recordType:"claim",
-        recordId:"validation-for-review-migration",
-        unit:profile.unit,
-        actorUid:currentUser.uid,
-        actorName:profile.displayName,
-        actorRole:profile.role,
-        updatedCount:targets.length,
-        createdAt:serverTimestamp()
-      });
-
-      setClaims(previous=>previous.map(record=>{
-        const workflow=String(record.stage||"").trim().toLowerCase();
-        const status=String(record.status||"").trim().toLowerCase();
-
-        const matched =
-          (workflow==="validation" || workflow.includes("validation")) &&
-          status==="for review";
-
-        return matched
-          ? {...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}
-          : record;
-      }));
-
-      try{
-        localStorage.setItem("pro4a-validation-for-review-migration-v1","done");
-      }catch{}
-
-      setOutPatientMigrationAvailable(false);
-
-      notify(`${targets.length} records updated in Firebase: Validation / For Review → Out Patient / Not Qualified.`);
-    }catch(error){
-      void recordSystemError("Validation / For Review migration failed",error);
-      notify(error instanceof Error?error.message:"Update failed. No migration tool was removed.");
-    }finally{
-      setOutPatientMigrationBusy(false);
-    }
   };
   const title = nav.find(n => n[0] === page)?.[1] ?? "Dashboard";
   const canOpenPage=(key:Page)=>!administratorOnlyPages.includes(key)||role==="administrator";
@@ -473,7 +372,7 @@ export default function Home() {
         </header>
         <div className="content">
           {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
-          {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} migrateOutPatient={migrateOutPatientRecords} migrationAvailable={outPatientMigrationAvailable} migrationBusy={outPatientMigrationBusy} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
+          {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
           {page==="retirees" && <RetireesPage title="Compulsory Retirees" collectionName="retirees" initialData={retireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="optional_retirees" && <RetireesPage title="Optional Retirees" collectionName="optionalRetirees" initialData={optionalRetireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="compliance" && <CompliancePage claims={scopedClaims} retirees={scopedRetirees} profile={profile} role={role} notify={notify}/>}
@@ -564,7 +463,7 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOpti
   </div>
 }
 
-function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;setQuery:(s:string)=>void;type:string;setType:(s:string)=>void;year:string;setYear:(s:string)=>void;status:string;setStatus:(s:string)=>void;exportExcel:()=>void;open:(state:ClaimModalState)=>void;remove:(id:string)=>void;refresh:()=>void;notify:(s:string)=>void;migrateOutPatient:()=>void;migrationAvailable:boolean;migrationBusy:boolean}) {
+function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;setQuery:(s:string)=>void;type:string;setType:(s:string)=>void;year:string;setYear:(s:string)=>void;status:string;setStatus:(s:string)=>void;exportExcel:()=>void;open:(state:ClaimModalState)=>void;remove:(id:string)=>void;refresh:()=>void;notify:(s:string)=>void}) {
   const [selected,setSelected]=useState<string[]>([]);
   const [bulkDate,setBulkDate]=useState(isoToday());
   const [bulkAction,setBulkAction]=useState("");
@@ -581,7 +480,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
     }catch{p.notify("Bulk update failed. No partial changes were written.");}
   };
   return <div className="stack">
-    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Validation / For Review Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
+    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button><button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
     {selected.length>0&&<section className="panel bulk-bar"><strong>{selected.length} selected {selected.length>400&&<small className="validation-error">Maximum 400</small>}</strong><label>Next follow-up<input type="date" value={bulkDate} onChange={e=>setBulkDate(e.target.value)}/></label><label>Action taken<input value={bulkAction} onChange={e=>setBulkAction(e.target.value)} placeholder="Enter common action taken"/></label><button className="primary" disabled={selected.length>400} onClick={bulkUpdate}><Send/>Apply Update</button><button className="outline" onClick={()=>setSelected([])}>Clear</button></section>}
     <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
