@@ -33,13 +33,14 @@ export type Claim = {
   requirements?: Record<string, boolean>;
   lastUpdateDate?: string; nextFollowUpDate?: string; assignedFocalPerson?: string; latestAction?: string;
 };
-const workflowStages=["Incident Recorded","Document Completion","Document Review","RHE Board Review","OP Validation","DILG Validation","NAPOLCOM Processing","Benefits Released"] as const;
-const claimStatuses=["Pending","In Process","For Review","Completed"] as const;
+const workflowStages=["Incident Recorded","Out Patient","Document Completion","Document Review","RHE Board Review","OP Validation","DILG Validation","NAPOLCOM Processing","Benefits Released"] as const;
+const claimStatuses=["Pending","Not Qualified","In Process","For Review","Completed"] as const;
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
+  if(/out[ -]?patient|outpatient|out[- ]patient/.test(text))return "Out Patient";
   if(/release|paid|received|complete/.test(text))return "Benefits Released";
   if(/napolcom/.test(text))return "NAPOLCOM Processing";
   if(/dilg/.test(text))return "DILG Validation";
@@ -50,8 +51,10 @@ const normalizeWorkflow=(value:string)=>{
   return "Incident Recorded";
 };
 const normalizeClaimStatus=(value:string,stage:string)=>{
+  if(normalizeWorkflow(stage)==="Out Patient")return "Not Qualified";
   const text=(value||"").trim().toLowerCase();
   if(text==="completed"||normalizeWorkflow(stage)==="Benefits Released")return "Completed";
+  if(text==="not qualified"||text==="not qualified")return "Not Qualified";
   if(text==="for review")return "For Review";
   if(text==="in process"||text==="in progress")return "In Process";
   return "Pending";
@@ -828,6 +831,7 @@ const inferUnit=(...values:string[])=>{
 };
 const workflowFromText=(text:string)=>{
   const value=text.toLowerCase();
+  if(/out[ -]?patient|outpatient|out[- ]patient/.test(value))return {stage:"Out Patient",status:"Not Qualified"};
   if(/received|released|paid|granted|enrolled|complete/.test(value))return {stage:"Benefits Released",status:"Completed"};
   if(/napolcom/.test(value))return {stage:"NAPOLCOM Processing",status:"For Review"};
   if(/dilg/.test(value))return {stage:"DILG Validation",status:"For Review"};
