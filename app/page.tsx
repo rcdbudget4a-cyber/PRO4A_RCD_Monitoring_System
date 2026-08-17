@@ -147,11 +147,6 @@ export default function Home() {
   const [outPatientMigrationAvailable,setOutPatientMigrationAvailable]=useState(true);
   const [outPatientMigrationBusy,setOutPatientMigrationBusy]=useState(false);
 
-  useEffect(()=>{
-    try {
-      if(localStorage.getItem("pro4a-outpatient-migration-v1")==="done") setOutPatientMigrationAvailable(false);
-    } catch {}
-  },[]);
   const recordSystemError=async(context:string,error:unknown)=>{
     if(!db||!currentUser||!profile)return;
     try{await addDoc(collection(db,"systemErrors"),{
@@ -274,7 +269,6 @@ export default function Home() {
       const snapshot=await getDocs(collection(db,"claims"));
       const targets=snapshot.docs.filter(item=>/out[\s-]*patient|outpatient/i.test(String((item.data() as Claim).stage||"")));
       if(!targets.length){
-        try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
         setOutPatientMigrationAvailable(false);
         notify("No existing Out Patient records were found. The migration tool has been removed.");
         return;
@@ -296,7 +290,6 @@ export default function Home() {
         updatedCount:targets.length,createdAt:serverTimestamp()
       });
       setClaims(previous=>previous.map(record=>targets.some(item=>item.id===record.id)?{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}:record));
-      try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
       setOutPatientMigrationAvailable(false);
       notify(`${targets.length} Out Patient records updated in Firebase. The migration tool has been removed.`);
     }catch(error){
