@@ -33,15 +33,14 @@ export type Claim = {
   requirements?: Record<string, boolean>;
   lastUpdateDate?: string; nextFollowUpDate?: string; assignedFocalPerson?: string; latestAction?: string;
 };
-const workflowStages=["Incident Recorded","Out Patient","Document Completion","Document Review","RHE Board Review","OP Validation","DILG Validation","NAPOLCOM Processing","Benefits Released"] as const;
-const claimStatuses=["Pending","In Process","For Review","Not Qualified","Completed"] as const;
+const workflowStages=["Incident Recorded","Document Completion","Document Review","RHE Board Review","OP Validation","DILG Validation","NAPOLCOM Processing","Benefits Released","Out Patient"] as const;
+const claimStatuses=["Pending","In Process","For Review","Completed","Not Qualified"] as const;
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
-const isOutPatientStage=(value:string)=>/\\bout[\\s-]*patient\\b/i.test((value||"").trim());
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
-  if(isOutPatientStage(value))return "Out Patient";
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
+  if(/out[\s-]*patient|outpatient/.test(text))return "Out Patient";
   if(/release|paid|received|complete/.test(text))return "Benefits Released";
   if(/napolcom/.test(text))return "NAPOLCOM Processing";
   if(/dilg/.test(text))return "DILG Validation";
@@ -53,7 +52,7 @@ const normalizeWorkflow=(value:string)=>{
 };
 const normalizeClaimStatus=(value:string,stage:string)=>{
   const text=(value||"").trim().toLowerCase();
-  if(isOutPatientStage(stage))return "Not Qualified";
+  if(normalizeWorkflow(stage)==="Out Patient")return "Not Qualified";
   if(text==="not qualified")return "Not Qualified";
   if(text==="completed"||normalizeWorkflow(stage)==="Benefits Released")return "Completed";
   if(text==="for review")return "For Review";
@@ -144,6 +143,14 @@ export default function Home() {
   const [modal, setModal] = useState<ClaimModalState | null>(null);
   const [toast, setToast] = useState("");
   const [lastSyncAt,setLastSyncAt]=useState<Date|null>(null);
+  const [outPatientMigrationAvailable,setOutPatientMigrationAvailable]=useState(true);
+  const [outPatientMigrationBusy,setOutPatientMigrationBusy]=useState(false);
+
+  useEffect(()=>{
+    try {
+      if(localStorage.getItem("pro4a-outpatient-migration-v1")==="done") setOutPatientMigrationAvailable(false);
+    } catch {}
+  },[]);
   const recordSystemError=async(context:string,error:unknown)=>{
     if(!db||!currentUser||!profile)return;
     try{await addDoc(collection(db,"systemErrors"),{
@@ -192,38 +199,8 @@ export default function Home() {
       : firestoreQuery(collection(db, "claims"), where("province", "==", profile.unit));
     return onSnapshot(source, snapshot => {
       const remote = snapshot.docs.map(item => item.data() as Claim);
-      const normalizedRemote = remote.map(record => {
-        if (isOutPatientStage(record.stage)) {
-          return { ...record, stage: "Out Patient", status: "Not Qualified" };
-        }
-        return record;
-      });
-      setClaims(normalizedRemote);
+      setClaims(remote);
       setLastSyncAt(new Date());
-
-      // One-time-safe data correction for existing KIPO/WIPO records.
-      // Any record already marked as Out Patient is persisted as:
-      // Workflow Stage = Out Patient, Status = Not Qualified.
-      if (profile.role === "admin" && db) {
-        const needsMigration = snapshot.docs.filter(item => {
-          const record = item.data() as Claim;
-          return isOutPatientStage(record.stage) &&
-            (record.stage !== "Out Patient" || record.status !== "Not Qualified");
-        });
-        if (needsMigration.length) {
-          const batch = writeBatch(db);
-          needsMigration.slice(0, 450).forEach(item => {
-            batch.set(doc(db!, "claims", item.id), {
-              stage: "Out Patient",
-              status: "Not Qualified",
-              lastUpdateDate: isoToday()
-            }, { merge: true });
-          });
-          void batch.commit().catch(error => {
-            void recordSystemError("Out Patient records migration failed", error);
-          });
-        }
-      }
     }, error => { void recordSystemError("Claims synchronization failed",error); setToast("Unable to load Firebase records."); setTimeout(() => setToast(""), 2500); });
   }, [profile]);
 
@@ -286,6 +263,47 @@ export default function Home() {
       oldValue:claims.find(item=>item.id===claim.id)||null,newValue:claim,createdAt:serverTimestamp()
     });
     await batch.commit();
+  };
+  const migrateOutPatientRecords=async()=>{
+    if(role!=="administrator"||!db||!currentUser){notify("Only administrators can update all Out Patient records.");return;}
+    if(outPatientMigrationBusy)return;
+    if(!confirm("Update all existing KIPO/WIPO records identified as Out Patient to Workflow Stage: Out Patient and Status: Not Qualified?\n\nThis will update the existing records in Firebase. Continue?"))return;
+    setOutPatientMigrationBusy(true);
+    try{
+      const snapshot=await getDocs(collection(db,"claims"));
+      const targets=snapshot.docs.filter(item=>/out[\s-]*patient|outpatient/i.test(String((item.data() as Claim).stage||"")));
+      if(!targets.length){
+        try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
+        setOutPatientMigrationAvailable(false);
+        notify("No existing Out Patient records were found. The migration tool has been removed.");
+        return;
+      }
+      const chunkSize=450;
+      for(let start=0;start<targets.length;start+=chunkSize){
+        const batch=writeBatch(db);
+        targets.slice(start,start+chunkSize).forEach(item=>{
+          const record=item.data() as Claim;
+          batch.set(doc(db,"claims",item.id),{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()},{merge:true});
+        });
+        await batch.commit();
+      }
+      await addDoc(collection(db,"activityHistory"),{
+        action:"Out Patient records migrated",
+        details:`${targets.length} existing KIPO/WIPO records updated to Workflow Stage: Out Patient and Status: Not Qualified`,
+        recordType:"claim",recordId:"out-patient-migration",unit:profile.unit,
+        actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,
+        updatedCount:targets.length,createdAt:serverTimestamp()
+      });
+      setClaims(previous=>previous.map(record=>targets.some(item=>item.id===record.id)?{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}:record));
+      try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
+      setOutPatientMigrationAvailable(false);
+      notify(`${targets.length} Out Patient records updated in Firebase. The migration tool has been removed.`);
+    }catch(error){
+      void recordSystemError("Out Patient migration failed",error);
+      notify("Out Patient update failed. No migration tool was removed.");
+    }finally{
+      setOutPatientMigrationBusy(false);
+    }
   };
   const title = nav.find(n => n[0] === page)?.[1] ?? "Dashboard";
   const canOpenPage=(key:Page)=>!administratorOnlyPages.includes(key)||role==="administrator";
@@ -402,7 +420,7 @@ export default function Home() {
         </header>
         <div className="content">
           {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
-          {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
+          {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} migrateOutPatient={migrateOutPatientRecords} migrationAvailable={outPatientMigrationAvailable} migrationBusy={outPatientMigrationBusy} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
           {page==="retirees" && <RetireesPage title="Compulsory Retirees" collectionName="retirees" initialData={retireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="optional_retirees" && <RetireesPage title="Optional Retirees" collectionName="optionalRetirees" initialData={optionalRetireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="compliance" && <CompliancePage claims={scopedClaims} retirees={scopedRetirees} profile={profile} role={role} notify={notify}/>}
@@ -493,7 +511,7 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOpti
   </div>
 }
 
-function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;setQuery:(s:string)=>void;type:string;setType:(s:string)=>void;year:string;setYear:(s:string)=>void;status:string;setStatus:(s:string)=>void;exportExcel:()=>void;open:(state:ClaimModalState)=>void;remove:(id:string)=>void;refresh:()=>void;notify:(s:string)=>void}) {
+function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;setQuery:(s:string)=>void;type:string;setType:(s:string)=>void;year:string;setYear:(s:string)=>void;status:string;setStatus:(s:string)=>void;exportExcel:()=>void;open:(state:ClaimModalState)=>void;remove:(id:string)=>void;refresh:()=>void;notify:(s:string)=>void;migrateOutPatient:()=>void;migrationAvailable:boolean;migrationBusy:boolean}) {
   const [selected,setSelected]=useState<string[]>([]);
   const [bulkDate,setBulkDate]=useState(isoToday());
   const [bulkAction,setBulkAction]=useState("");
@@ -510,7 +528,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
     }catch{p.notify("Bulk update failed. No partial changes were written.");}
   };
   return <div className="stack">
-    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button><button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
+    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Out Patient Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
     {selected.length>0&&<section className="panel bulk-bar"><strong>{selected.length} selected {selected.length>400&&<small className="validation-error">Maximum 400</small>}</strong><label>Next follow-up<input type="date" value={bulkDate} onChange={e=>setBulkDate(e.target.value)}/></label><label>Action taken<input value={bulkAction} onChange={e=>setBulkAction(e.target.value)} placeholder="Enter common action taken"/></label><button className="primary" disabled={selected.length>400} onClick={bulkUpdate}><Send/>Apply Update</button><button className="outline" onClick={()=>setSelected([])}>Clear</button></section>}
     <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
@@ -810,7 +828,7 @@ function ClaimModal({claim,readOnly,role,assignedUnit,close,save}:{claim:Claim|n
     <input type="hidden" value={data.id}/><label>Claim Type<select value={data.type} onChange={e=>field("type",e.target.value)}><option>KIPO</option><option>WIPO</option></select></label>
     <label>Rank<input required value={data.rank} onChange={e=>field("rank",e.target.value.toUpperCase())}/></label><label>Full Name<input required value={data.name} onChange={e=>field("name",e.target.value.toUpperCase())}/></label>
     <label>Unit / Province<select required disabled={role==="unit_user"||readOnly} value={data.province} onChange={e=>field("province",e.target.value)}>{operationalUnits.map(x=><option key={x}>{x}</option>)}</select></label><label>Office<input required value={data.office} onChange={e=>field("office",e.target.value)}/></label>
-    <label>Date of Incident<input required type="date" value={data.date} onChange={e=>field("date",e.target.value)}/></label><label>Workflow Stage<select value={normalizeWorkflow(data.stage)} onChange={e=>{const nextStage=e.target.value;setData(current=>({...current,stage:nextStage,status:isOutPatientStage(nextStage)?"Not Qualified":normalizeClaimStatus(current.status,nextStage)}))}}>{workflowStages.map(x=><option key={x}>{x}</option>)}</select></label><label>Status<select disabled={isOutPatientStage(data.stage)} value={normalizeClaimStatus(data.status,data.stage)} onChange={e=>field("status",e.target.value)}>{claimStatuses.map(x=><option key={x}>{x}</option>)}</select>{isOutPatientStage(data.stage)&&<small className="form-hint">Out Patient records are automatically Not Qualified.</small>}</label>
+    <label>Date of Incident<input required type="date" value={data.date} onChange={e=>field("date",e.target.value)}/></label><label>Workflow Stage<select value={normalizeWorkflow(data.stage)} onChange={e=>{const nextStage=e.target.value;setData(current=>({...current,stage:nextStage,status:normalizeClaimStatus(current.status,nextStage)}));}}>{workflowStages.map(x=><option key={x}>{x}</option>)}</select></label><label>Status<select disabled={normalizeWorkflow(data.stage)==="Out Patient"} value={normalizeClaimStatus(data.status,data.stage)} onChange={e=>field("status",e.target.value)}>{claimStatuses.map(x=><option key={x}>{x}</option>)}</select></label>
     <label>Last Update Date<input type="date" value={data.lastUpdateDate||""} onChange={e=>field("lastUpdateDate",e.target.value)}/></label><label>Next Follow-up Date<input type="date" value={data.nextFollowUpDate||""} onChange={e=>field("nextFollowUpDate",e.target.value)}/></label><label>Assigned Focal Person<input value={data.assignedFocalPerson||""} onChange={e=>field("assignedFocalPerson",e.target.value)}/></label><label className="wide">Latest Action Taken<textarea rows={2} value={data.latestAction||""} onChange={e=>field("latestAction",e.target.value)}/></label>
   </div><section className="requirements-section"><div className="benefits-heading"><div><p>Documentary Requirements</p><strong>{Object.values(data.requirements||{}).filter(Boolean).length} of {claimRequirements.length} complete</strong></div><small>Check only documents already verified.</small></div><div className="requirements-checklist">{claimRequirements.map(item=><label key={item}><input type="checkbox" checked={Boolean(data.requirements?.[item])} onChange={e=>setData(current=>({...current,requirements:{...(current.requirements||{}),[item]:e.target.checked}}))}/><span>{item}</span></label>)}</div></section><section className="benefits-section"><div className="benefits-heading"><div><p>Claims and Benefits</p><strong>Benefits monitoring</strong></div><small>{readOnly?"Current recorded status":"Enter the status, amount, date, or remarks for each applicable benefit."}</small></div><div className="benefits-matrix">{benefitGroups.map(group=><article className={`benefit-group ${group.items.length===1?"compact":""}`} key={group.title}><h4>{group.title}</h4><div>{group.items.map(([key,label])=><label key={key}><span>{label}</span><textarea rows={2} placeholder={readOnly?"No entry recorded":"Enter status or remarks"} value={benefitValue(key)} onChange={e=>benefit(key,e.target.value)}/></label>)}</div></article>)}</div></section><div className="workflow"><strong>Workflow progress</strong><div>{["Incident Recorded","Document Completion","RHE Board Review","OP Validation","Benefits Released"].map((x,i)=>{const current=workflowStages.indexOf(normalizeWorkflow(data.stage) as typeof workflowStages[number]);const target=workflowStages.indexOf(x as typeof workflowStages[number]);const done=current>=target;return <span className={done?"done":""} key={x}><b>{done?"✓":i+1}</b>{x.replace(" Recorded","").replace(" Completion","").replace("RHE ","").replace("OP ","")}</span>})}</div></div></fieldset><div className="modal-actions"><button type="button" className="outline" onClick={close}>{readOnly?"Close":"Cancel"}</button>{!readOnly&&<button className="primary">Save Record</button>}</div></form></div>
 }
