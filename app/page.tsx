@@ -36,8 +36,10 @@ export type Claim = {
 const workflowStages=["Incident Recorded","Out Patient","Document Completion","Document Review","RHE Board Review","OP Validation","DILG Validation","NAPOLCOM Processing","Benefits Released"] as const;
 const claimStatuses=["Pending","In Process","For Review","Not Qualified","Completed"] as const;
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
+const isOutPatientStage=(value:string)=>/\\bout[\\s-]*patient\\b/i.test((value||"").trim());
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
+  if(isOutPatientStage(value))return "Out Patient";
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
   if(/release|paid|received|complete/.test(text))return "Benefits Released";
@@ -50,12 +52,11 @@ const normalizeWorkflow=(value:string)=>{
   return "Incident Recorded";
 };
 const normalizeClaimStatus=(value:string,stage:string)=>{
-  const normalizedStage=normalizeWorkflow(stage);
   const text=(value||"").trim().toLowerCase();
-  if(normalizedStage==="Out Patient")return "Not Qualified";
-  if(text==="completed"||normalizedStage==="Benefits Released")return "Completed";
-  if(text==="for review")return "For Review";
+  if(isOutPatientStage(stage))return "Not Qualified";
   if(text==="not qualified")return "Not Qualified";
+  if(text==="completed"||normalizeWorkflow(stage)==="Benefits Released")return "Completed";
+  if(text==="for review")return "For Review";
   if(text==="in process"||text==="in progress")return "In Process";
   return "Pending";
 };
@@ -191,8 +192,38 @@ export default function Home() {
       : firestoreQuery(collection(db, "claims"), where("province", "==", profile.unit));
     return onSnapshot(source, snapshot => {
       const remote = snapshot.docs.map(item => item.data() as Claim);
-      setClaims(remote);
+      const normalizedRemote = remote.map(record => {
+        if (isOutPatientStage(record.stage)) {
+          return { ...record, stage: "Out Patient", status: "Not Qualified" };
+        }
+        return record;
+      });
+      setClaims(normalizedRemote);
       setLastSyncAt(new Date());
+
+      // One-time-safe data correction for existing KIPO/WIPO records.
+      // Any record already marked as Out Patient is persisted as:
+      // Workflow Stage = Out Patient, Status = Not Qualified.
+      if (profile.role === "admin" && db) {
+        const needsMigration = snapshot.docs.filter(item => {
+          const record = item.data() as Claim;
+          return isOutPatientStage(record.stage) &&
+            (record.stage !== "Out Patient" || record.status !== "Not Qualified");
+        });
+        if (needsMigration.length) {
+          const batch = writeBatch(db);
+          needsMigration.slice(0, 450).forEach(item => {
+            batch.set(doc(db!, "claims", item.id), {
+              stage: "Out Patient",
+              status: "Not Qualified",
+              lastUpdateDate: isoToday()
+            }, { merge: true });
+          });
+          void batch.commit().catch(error => {
+            void recordSystemError("Out Patient records migration failed", error);
+          });
+        }
+      }
     }, error => { void recordSystemError("Claims synchronization failed",error); setToast("Unable to load Firebase records."); setTimeout(() => setToast(""), 2500); });
   }, [profile]);
 
@@ -399,7 +430,7 @@ export default function Home() {
         if(modal.mode==="new"&&claims.some(existing=>existing.id.toLowerCase()===c.id.toLowerCase())){notify("Claim ID already exists. Use a unique ID.");return;}
         const duplicate=potentialDuplicate(c,claims,modal.claim?.id);
         if(duplicate){notify(`Possible duplicate: ${duplicate.rank} ${duplicate.name} (${duplicate.province}). Review the existing record first.`);return;}
-        const normalizedStage=normalizeWorkflow(c.stage); const normalized={...c,stage:normalizedStage,status:normalizeClaimStatus(c.status,normalizedStage),lastUpdateDate:isoToday()};
+        const normalized={...c,stage:normalizeWorkflow(c.stage),status:normalizeClaimStatus(c.status,c.stage),lastUpdateDate:isoToday()};
         try{if(db)await saveClaimWithAudit(normalized,modal.mode==="new"?"Claim created":"Claim updated");setClaims(prev => prev.some(x=>x.id===normalized.id)?prev.map(x=>x.id===normalized.id?normalized:x):[normalized,...prev]);setModal(null);notify(firebaseConfigured?`Record saved • ${new Date().toLocaleString("en-PH")}`:"Record saved in demonstration mode.");}catch{notify("Save failed. No partial record or audit entry was written.");}}}/>}
     </main>
   );
@@ -779,9 +810,9 @@ function ClaimModal({claim,readOnly,role,assignedUnit,close,save}:{claim:Claim|n
     <input type="hidden" value={data.id}/><label>Claim Type<select value={data.type} onChange={e=>field("type",e.target.value)}><option>KIPO</option><option>WIPO</option></select></label>
     <label>Rank<input required value={data.rank} onChange={e=>field("rank",e.target.value.toUpperCase())}/></label><label>Full Name<input required value={data.name} onChange={e=>field("name",e.target.value.toUpperCase())}/></label>
     <label>Unit / Province<select required disabled={role==="unit_user"||readOnly} value={data.province} onChange={e=>field("province",e.target.value)}>{operationalUnits.map(x=><option key={x}>{x}</option>)}</select></label><label>Office<input required value={data.office} onChange={e=>field("office",e.target.value)}/></label>
-    <label>Date of Incident<input required type="date" value={data.date} onChange={e=>field("date",e.target.value)}/></label><label>Workflow Stage<select value={normalizeWorkflow(data.stage)} onChange={e=>{const nextStage=e.target.value;setData(current=>({...current,stage:nextStage,status:nextStage==="Out Patient"?"Not Qualified":current.status}))}}>{workflowStages.map(x=><option key={x}>{x}</option>)}</select></label><label>Status<select value={normalizeClaimStatus(data.status,data.stage)} onChange={e=>field("status",e.target.value)} disabled={normalizeWorkflow(data.stage)==="Out Patient"}>{claimStatuses.map(x=><option key={x}>{x}</option>)}</select></label>
+    <label>Date of Incident<input required type="date" value={data.date} onChange={e=>field("date",e.target.value)}/></label><label>Workflow Stage<select value={normalizeWorkflow(data.stage)} onChange={e=>{const nextStage=e.target.value;setData(current=>({...current,stage:nextStage,status:isOutPatientStage(nextStage)?"Not Qualified":normalizeClaimStatus(current.status,nextStage)}))}}>{workflowStages.map(x=><option key={x}>{x}</option>)}</select></label><label>Status<select disabled={isOutPatientStage(data.stage)} value={normalizeClaimStatus(data.status,data.stage)} onChange={e=>field("status",e.target.value)}>{claimStatuses.map(x=><option key={x}>{x}</option>)}</select>{isOutPatientStage(data.stage)&&<small className="form-hint">Out Patient records are automatically Not Qualified.</small>}</label>
     <label>Last Update Date<input type="date" value={data.lastUpdateDate||""} onChange={e=>field("lastUpdateDate",e.target.value)}/></label><label>Next Follow-up Date<input type="date" value={data.nextFollowUpDate||""} onChange={e=>field("nextFollowUpDate",e.target.value)}/></label><label>Assigned Focal Person<input value={data.assignedFocalPerson||""} onChange={e=>field("assignedFocalPerson",e.target.value)}/></label><label className="wide">Latest Action Taken<textarea rows={2} value={data.latestAction||""} onChange={e=>field("latestAction",e.target.value)}/></label>
-  </div><section className="requirements-section"><div className="benefits-heading"><div><p>Documentary Requirements</p><strong>{Object.values(data.requirements||{}).filter(Boolean).length} of {claimRequirements.length} complete</strong></div><small>Check only documents already verified.</small></div><div className="requirements-checklist">{claimRequirements.map(item=><label key={item}><input type="checkbox" checked={Boolean(data.requirements?.[item])} onChange={e=>setData(current=>({...current,requirements:{...(current.requirements||{}),[item]:e.target.checked}}))}/><span>{item}</span></label>)}</div></section><section className="benefits-section"><div className="benefits-heading"><div><p>Claims and Benefits</p><strong>Benefits monitoring</strong></div><small>{readOnly?"Current recorded status":"Enter the status, amount, date, or remarks for each applicable benefit."}</small></div><div className="benefits-matrix">{benefitGroups.map(group=><article className={`benefit-group ${group.items.length===1?"compact":""}`} key={group.title}><h4>{group.title}</h4><div>{group.items.map(([key,label])=><label key={key}><span>{label}</span><textarea rows={2} placeholder={readOnly?"No entry recorded":"Enter status or remarks"} value={benefitValue(key)} onChange={e=>benefit(key,e.target.value)}/></label>)}</div></article>)}</div></section><div className="workflow"><strong>Workflow progress</strong><div>{["Incident Recorded","Out Patient","Document Completion","RHE Board Review","OP Validation","Benefits Released"].map((x,i)=>{const current=workflowStages.indexOf(normalizeWorkflow(data.stage) as typeof workflowStages[number]);const target=workflowStages.indexOf(x as typeof workflowStages[number]);const done=current>=target;return <span className={done?"done":""} key={x}><b>{done?"✓":i+1}</b>{x.replace(" Recorded","").replace(" Completion","").replace("RHE ","").replace("OP ","")}</span>})}</div></div></fieldset><div className="modal-actions"><button type="button" className="outline" onClick={close}>{readOnly?"Close":"Cancel"}</button>{!readOnly&&<button className="primary">Save Record</button>}</div></form></div>
+  </div><section className="requirements-section"><div className="benefits-heading"><div><p>Documentary Requirements</p><strong>{Object.values(data.requirements||{}).filter(Boolean).length} of {claimRequirements.length} complete</strong></div><small>Check only documents already verified.</small></div><div className="requirements-checklist">{claimRequirements.map(item=><label key={item}><input type="checkbox" checked={Boolean(data.requirements?.[item])} onChange={e=>setData(current=>({...current,requirements:{...(current.requirements||{}),[item]:e.target.checked}}))}/><span>{item}</span></label>)}</div></section><section className="benefits-section"><div className="benefits-heading"><div><p>Claims and Benefits</p><strong>Benefits monitoring</strong></div><small>{readOnly?"Current recorded status":"Enter the status, amount, date, or remarks for each applicable benefit."}</small></div><div className="benefits-matrix">{benefitGroups.map(group=><article className={`benefit-group ${group.items.length===1?"compact":""}`} key={group.title}><h4>{group.title}</h4><div>{group.items.map(([key,label])=><label key={key}><span>{label}</span><textarea rows={2} placeholder={readOnly?"No entry recorded":"Enter status or remarks"} value={benefitValue(key)} onChange={e=>benefit(key,e.target.value)}/></label>)}</div></article>)}</div></section><div className="workflow"><strong>Workflow progress</strong><div>{["Incident Recorded","Document Completion","RHE Board Review","OP Validation","Benefits Released"].map((x,i)=>{const current=workflowStages.indexOf(normalizeWorkflow(data.stage) as typeof workflowStages[number]);const target=workflowStages.indexOf(x as typeof workflowStages[number]);const done=current>=target;return <span className={done?"done":""} key={x}><b>{done?"✓":i+1}</b>{x.replace(" Recorded","").replace(" Completion","").replace("RHE ","").replace("OP ","")}</span>})}</div></div></fieldset><div className="modal-actions"><button type="button" className="outline" onClick={close}>{readOnly?"Close":"Cancel"}</button>{!readOnly&&<button className="primary">Save Record</button>}</div></form></div>
 }
 
 type ImportKind="claims"|"retirees"|"optionalRetirees";
