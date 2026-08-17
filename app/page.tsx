@@ -61,14 +61,6 @@ const normalizeClaimStatus=(value:string,stage:string)=>{
   return "Pending";
 };
 const isoToday=()=>new Date().toISOString().slice(0,10);
-const normalizeOutPatientText=(value:string)=>{
-  const text=(value||"").trim();
-  if(!text)return text;
-  return text.replace(/out\s*-?\s*patient/gi,"Out Patient");
-};
-const benefitsContainOutPatient=(benefits?:Record<string,string>)=>
-  Object.values(benefits||{}).some(value=>/out\s*-?\s*patient/i.test(value||""));
-
 const sanitizeRecord = <T extends Record<string, unknown>>(obj: T): T => {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
@@ -157,8 +149,10 @@ export default function Home() {
 
   useEffect(()=>{
     try {
-      if(localStorage.getItem("pro4a-outpatient-migration-v1")==="done") setOutPatientMigrationAvailable(false);
-    } catch {}
+      setOutPatientMigrationAvailable(localStorage.getItem("pro4a-outpatient-migration-v2")==="done" ? false : true);
+    } catch {
+      setOutPatientMigrationAvailable(true);
+    }
   },[]);
   const recordSystemError=async(context:string,error:unknown)=>{
     if(!db||!currentUser||!profile)return;
@@ -276,15 +270,18 @@ export default function Home() {
   const migrateOutPatientRecords=async()=>{
     if(role!=="administrator"||!db||!currentUser){notify("Only administrators can update all Out Patient records.");return;}
     if(outPatientMigrationBusy)return;
-    if(!confirm("Update all existing KIPO/WIPO records identified as Out Patient to Workflow Stage: Out Patient and Status: Not Qualified?\n\nThis will update the existing records in Firebase. Continue?"))return;
+    if(!confirm("Update all existing KIPO/WIPO records containing Out Patient in Workflow Stage or Claims & Benefits?\\n\\nThey will be saved as Workflow Stage: Out Patient and Status: Not Qualified. Continue?"))return;
     setOutPatientMigrationBusy(true);
     try{
       const snapshot=await getDocs(collection(db,"claims"));
-      const targets=snapshot.docs.filter(item=>/out[\s-]*patient|outpatient/i.test(String((item.data() as Claim).stage||"")));
+      const targets=snapshot.docs.filter(item=>{
+        const record=item.data() as Claim;
+        const stageText=String(record.stage||"");
+        const benefitText=Object.values(record.benefits||{}).map(value=>String(value||"")).join(" ");
+        return /out\\s*-?\\s*patient/i.test(stageText) || /out\\s*-?\\s*patient/i.test(benefitText);
+      });
       if(!targets.length){
-        try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
-        setOutPatientMigrationAvailable(false);
-        notify("No existing Out Patient records were found. The migration tool has been removed.");
+        notify("No Out Patient records were found.");
         return;
       }
       const chunkSize=450;
@@ -292,24 +289,51 @@ export default function Home() {
         const batch=writeBatch(db);
         targets.slice(start,start+chunkSize).forEach(item=>{
           const record=item.data() as Claim;
-          batch.set(doc(db,"claims",item.id),{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()},{merge:true});
+          const benefits=Object.fromEntries(
+            Object.entries(record.benefits||{}).map(([key,value])=>[
+              key,
+              /out\\s*-?\\s*patient/i.test(String(value||"")) ? "Out Patient" : value
+            ])
+          );
+          batch.set(doc(db,"claims",item.id),{
+            ...record,
+            benefits,
+            stage:"Out Patient",
+            status:"Not Qualified",
+            lastUpdateDate:isoToday()
+          },{merge:true});
         });
         await batch.commit();
       }
       await addDoc(collection(db,"activityHistory"),{
         action:"Out Patient records migrated",
-        details:`${targets.length} existing KIPO/WIPO records updated to Workflow Stage: Out Patient and Status: Not Qualified`,
-        recordType:"claim",recordId:"out-patient-migration",unit:profile.unit,
-        actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,
-        updatedCount:targets.length,createdAt:serverTimestamp()
+        details:`${targets.length} existing KIPO/WIPO records updated from Out Patient entries in Workflow Stage or Claims & Benefits`,
+        recordType:"claim",
+        recordId:"out-patient-migration",
+        unit:profile.unit,
+        actorUid:currentUser.uid,
+        actorName:profile.displayName,
+        actorRole:profile.role,
+        updatedCount:targets.length,
+        createdAt:serverTimestamp()
       });
-      setClaims(previous=>previous.map(record=>targets.some(item=>item.id===record.id)?{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}:record));
-      try{localStorage.setItem("pro4a-outpatient-migration-v1","done")}catch{}
+      setClaims(previous=>previous.map(record=>{
+        const matched=targets.some(item=>item.id===record.id);
+        if(!matched)return record;
+        const benefits=Object.fromEntries(
+          Object.entries(record.benefits||{}).map(([key,value])=>[
+            key,
+            /out\\s*-?\\s*patient/i.test(String(value||"")) ? "Out Patient" : value
+          ])
+        );
+        return {...record,benefits,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()};
+      }));
+      try{localStorage.setItem("pro4a-outpatient-migration-v2","done")}catch{}
       setOutPatientMigrationAvailable(false);
       notify(`${targets.length} Out Patient records updated in Firebase. The migration tool has been removed.`);
     }catch(error){
       void recordSystemError("Out Patient migration failed",error);
-      notify("Out Patient update failed. No migration tool was removed.");
+      notify(error instanceof Error?error.message:"Out Patient update failed. No records were changed by the migration.");
     }finally{
       setOutPatientMigrationBusy(false);
     }
@@ -457,9 +481,7 @@ export default function Home() {
         if(modal.mode==="new"&&claims.some(existing=>existing.id.toLowerCase()===c.id.toLowerCase())){notify("Claim ID already exists. Use a unique ID.");return;}
         const duplicate=potentialDuplicate(c,claims,modal.claim?.id);
         if(duplicate){notify(`Possible duplicate: ${duplicate.rank} ${duplicate.name} (${duplicate.province}). Review the existing record first.`);return;}
-        const normalizedStage=normalizeWorkflow(c.stage);
-        const normalizedBenefits=Object.fromEntries(Object.entries(c.benefits||{}).map(([key,value])=>[key,normalizeOutPatientText(String(value||""))]));
-        const normalized={...c,benefits:normalizedBenefits,stage:normalizedStage,status:normalizeClaimStatus(c.status,normalizedStage),lastUpdateDate:isoToday()};
+        const normalized={...c,stage:normalizeWorkflow(c.stage),status:normalizeClaimStatus(c.status,c.stage),lastUpdateDate:isoToday()};
         try{if(db)await saveClaimWithAudit(normalized,modal.mode==="new"?"Claim created":"Claim updated");setClaims(prev => prev.some(x=>x.id===normalized.id)?prev.map(x=>x.id===normalized.id?normalized:x):[normalized,...prev]);setModal(null);notify(firebaseConfigured?`Record saved • ${new Date().toLocaleString("en-PH")}`:"Record saved in demonstration mode.");}catch{notify("Save failed. No partial record or audit entry was written.");}}}/>}
     </main>
   );
@@ -526,58 +548,6 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
   const [selected,setSelected]=useState<string[]>([]);
   const [bulkDate,setBulkDate]=useState(isoToday());
   const [bulkAction,setBulkAction]=useState("");
-  const [outPatientMigrationDone,setOutPatientMigrationDone]=useState(false);
-  const [outPatientMigrationBusy,setOutPatientMigrationBusy]=useState(false);
-  const fixOutPatientRecords=async()=>{
-    if(p.role!=="administrator"||!db||!auth?.currentUser){p.notify("Administrator access is required.");return;}
-    if(!confirm("Update all KIPO/WIPO records containing Out Patient in Claims and Benefits?"))return;
-    setOutPatientMigrationBusy(true);
-    try{
-      const snapshot=await getDocs(collection(db,"claims"));
-      const targets=snapshot.docs.filter(item=>{
-        const record=item.data() as Claim;
-        return benefitsContainOutPatient(record.benefits)||/out\s*-?\s*patient/i.test(String(record.stage||""));
-      });
-      if(!targets.length){
-        setOutPatientMigrationDone(true);
-        p.notify("No Out Patient records were found.");
-        return;
-      }
-      const batch=writeBatch(db);
-      targets.forEach(item=>{
-        const record=item.data() as Claim;
-        const benefits=Object.fromEntries(
-          Object.entries(record.benefits||{}).map(([key,value])=>[key,normalizeOutPatientText(String(value||""))])
-        );
-        batch.set(item.ref,{
-          benefits,
-          stage:"Out Patient",
-          status:"Not Qualified",
-          lastUpdateDate:isoToday()
-        },{merge:true});
-      });
-      batch.set(doc(collection(db,"activityHistory")),{
-        action:"Out Patient records migrated",
-        details:`${targets.length} KIPO/WIPO records updated to Out Patient / Not Qualified`,
-        recordType:"claim",
-        recordId:"out-patient-migration",
-        unit:p.profile.unit,
-        actorUid:auth.currentUser.uid,
-        actorName:p.profile.displayName,
-        actorRole:p.profile.role,
-        newValue:{count:targets.length,stage:"Out Patient",status:"Not Qualified",benefitText:"Out Patient"},
-        createdAt:serverTimestamp()
-      });
-      await batch.commit();
-      setOutPatientMigrationDone(true);
-      p.notify(`${targets.length} Out Patient record${targets.length===1?"":"s"} updated in Firebase.`);
-    }catch(error){
-      console.error("Out Patient migration failed:",error);
-      p.notify(error instanceof Error?error.message:"Out Patient migration failed. Check Firebase permissions.");
-    }finally{
-      setOutPatientMigrationBusy(false);
-    }
-  };
   const toggle=(id:string)=>setSelected(previous=>previous.includes(id)?previous.filter(item=>item!==id):[...previous,id]);
   const bulkUpdate=async()=>{
     if(!db||!selected.length||!bulkDate||!bulkAction.trim())return;
@@ -591,7 +561,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
     }catch{p.notify("Bulk update failed. No partial changes were written.");}
   };
   return <div className="stack">
-    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Out Patient Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
+    <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" style={{borderColor:"#efc45d",color:"#efc45d"}} disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Out Patient Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
     {selected.length>0&&<section className="panel bulk-bar"><strong>{selected.length} selected {selected.length>400&&<small className="validation-error">Maximum 400</small>}</strong><label>Next follow-up<input type="date" value={bulkDate} onChange={e=>setBulkDate(e.target.value)}/></label><label>Action taken<input value={bulkAction} onChange={e=>setBulkAction(e.target.value)} placeholder="Enter common action taken"/></label><button className="primary" disabled={selected.length>400} onClick={bulkUpdate}><Send/>Apply Update</button><button className="outline" onClick={()=>setSelected([])}>Clear</button></section>}
     <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
@@ -875,7 +845,7 @@ function RetireeModal({title="Compulsory Retiree",retiree,role,assignedUnit,clos
 function ClaimModal({claim,readOnly,role,assignedUnit,close,save}:{claim:Claim|null;readOnly:boolean;role:Role;assignedUnit:string;close:()=>void;save:(c:Claim)=>void}) {
   const [data,setData]=useState<Claim>(()=>{const now=new Date();return claim??{id:`KIPO-${now.getFullYear()}-${String(now.getTime()).slice(-3)}`,type:"KIPO",year:now.getFullYear(),rank:"",name:"",province:role==="unit_user"?assignedUnit:"RHQ",office:"",stage:"Incident Recorded",status:"Pending",date:now.toISOString().slice(0,10),lastUpdateDate:isoToday(),requirements:{}}});
   const field=(key:keyof Claim,value:string|number)=>setData({...data,[key]:value});
-  const benefit=(key:string,value:string)=>setData(current=>({...current,benefits:{...(current.benefits||{}),[key]:normalizeOutPatientText(value)}}));
+  const benefit=(key:string,value:string)=>setData(current=>({...current,benefits:{...(current.benefits||{}),[key]:value}}));
   const benefitValue=(key:string)=>data.benefits?.[key]||(key==="pnpSfa"?data.benefits?.rhe:key==="promotion"?data.benefits?.specialPromotion:"")||"";
   const benefitGroups=[
     {title:"PNP",items:[["pnpSfa","PNP-SFA RA 6963"],["cal","CAL"],["promotion","Promotion"],["awards","Awards"]]},
