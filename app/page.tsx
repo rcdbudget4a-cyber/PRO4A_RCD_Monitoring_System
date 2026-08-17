@@ -38,7 +38,6 @@ const claimStatuses=["Pending","In Process","For Review","Completed","Not Qualif
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
-  if(/out[ -]?patient/.test(text))return "Out Patient";
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
   if(/out[\s-]*patient|outpatient/.test(text))return "Out Patient";
@@ -147,6 +146,13 @@ export default function Home() {
   const [outPatientMigrationAvailable,setOutPatientMigrationAvailable]=useState(true);
   const [outPatientMigrationBusy,setOutPatientMigrationBusy]=useState(false);
 
+  useEffect(()=>{
+    try {
+      setOutPatientMigrationAvailable(localStorage.getItem("pro4a-outpatient-migration-v3")!=="done");
+    } catch {
+      setOutPatientMigrationAvailable(true);
+    }
+  },[]);
   const recordSystemError=async(context:string,error:unknown)=>{
     if(!db||!currentUser||!profile)return;
     try{await addDoc(collection(db,"systemErrors"),{
@@ -267,8 +273,12 @@ export default function Home() {
     setOutPatientMigrationBusy(true);
     try{
       const snapshot=await getDocs(collection(db,"claims"));
-      const targets=snapshot.docs.filter(item=>/out[\s-]*patient|outpatient/i.test(String((item.data() as Claim).stage||"")));
+      const targets=snapshot.docs.filter(item=>{
+        const stage=String((item.data() as Claim).stage||"").trim();
+        return /out\s*-?\s*patient/i.test(stage);
+      });
       if(!targets.length){
+        try{localStorage.setItem("pro4a-outpatient-migration-v3","done")}catch{}
         setOutPatientMigrationAvailable(false);
         notify("No existing Out Patient records were found. The migration tool has been removed.");
         return;
@@ -290,6 +300,7 @@ export default function Home() {
         updatedCount:targets.length,createdAt:serverTimestamp()
       });
       setClaims(previous=>previous.map(record=>targets.some(item=>item.id===record.id)?{...record,stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()}:record));
+      try{localStorage.setItem("pro4a-outpatient-migration-v3","done")}catch{}
       setOutPatientMigrationAvailable(false);
       notify(`${targets.length} Out Patient records updated in Firebase. The migration tool has been removed.`);
     }catch(error){
@@ -442,8 +453,7 @@ export default function Home() {
         if(modal.mode==="new"&&claims.some(existing=>existing.id.toLowerCase()===c.id.toLowerCase())){notify("Claim ID already exists. Use a unique ID.");return;}
         const duplicate=potentialDuplicate(c,claims,modal.claim?.id);
         if(duplicate){notify(`Possible duplicate: ${duplicate.rank} ${duplicate.name} (${duplicate.province}). Review the existing record first.`);return;}
-        const normalizedStage=normalizeWorkflow(c.stage);
-        const normalized={...c,stage:normalizedStage,status:normalizeClaimStatus(c.status,normalizedStage),lastUpdateDate:isoToday()};
+        const normalized={...c,stage:normalizeWorkflow(c.stage),status:normalizeClaimStatus(c.status,c.stage),lastUpdateDate:isoToday()};
         try{if(db)await saveClaimWithAudit(normalized,modal.mode==="new"?"Claim created":"Claim updated");setClaims(prev => prev.some(x=>x.id===normalized.id)?prev.map(x=>x.id===normalized.id?normalized:x):[normalized,...prev]);setModal(null);notify(firebaseConfigured?`Record saved • ${new Date().toLocaleString("en-PH")}`:"Record saved in demonstration mode.");}catch{notify("Save failed. No partial record or audit entry was written.");}}}/>}
     </main>
   );
@@ -511,33 +521,6 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
   const [bulkDate,setBulkDate]=useState(isoToday());
   const [bulkAction,setBulkAction]=useState("");
   const toggle=(id:string)=>setSelected(previous=>previous.includes(id)?previous.filter(item=>item!==id):[...previous,id]);
-  const [migrationDone,setMigrationDone]=useState(false);
-  const [migrationBusy,setMigrationBusy]=useState(false);
-  const fixOutPatientRecords=async()=>{
-    if(p.role!=="administrator"||!db)return;
-    if(!confirm("Update all existing Out Patient KIPO/WIPO records to Status = Not Qualified?"))return;
-    setMigrationBusy(true);
-    try{
-      const snapshot=await getDocs(collection(db,"claims"));
-      const targets=snapshot.docs.filter(item=>{
-        const record=item.data() as Claim;
-        return normalizeWorkflow(record.stage)==="Out Patient";
-      });
-      if(!targets.length){setMigrationDone(true);p.notify("No Out Patient records needed updating.");return;}
-      const batch=writeBatch(db);
-      targets.forEach(item=>{
-        const record=item.data() as Claim;
-        batch.set(item.ref,{stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()},{merge:true});
-      });
-      await batch.commit();
-      setMigrationDone(true);
-      p.notify(`${targets.length} Out Patient record${targets.length===1?"":"s"} updated in Firebase.`);
-    }catch(error){
-      p.notify(error instanceof Error?error.message:"Unable to update Out Patient records.");
-    }finally{
-      setMigrationBusy(false);
-    }
-  };
   const bulkUpdate=async()=>{
     if(!db||!selected.length||!bulkDate||!bulkAction.trim())return;
     if(selected.length>400){p.notify("Select no more than 400 records per bulk update.");return;}
