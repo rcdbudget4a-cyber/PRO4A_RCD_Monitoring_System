@@ -38,6 +38,7 @@ const claimStatuses=["Pending","In Process","For Review","Completed","Not Qualif
 const claimRequirements=["Incident/Spot Report","Investigation Report","Medical Certificate","Service Record","Latest Payslip","Valid IDs","Clearances","Endorsement"] as const;
 const normalizeWorkflow=(value:string)=>{
   const text=(value||"").trim().toLowerCase();
+  if(/out[ -]?patient/.test(text))return "Out Patient";
   const exact=workflowStages.find(item=>item.toLowerCase()===text);
   if(exact)return exact;
   if(/out[\s-]*patient|outpatient/.test(text))return "Out Patient";
@@ -448,7 +449,8 @@ export default function Home() {
         if(modal.mode==="new"&&claims.some(existing=>existing.id.toLowerCase()===c.id.toLowerCase())){notify("Claim ID already exists. Use a unique ID.");return;}
         const duplicate=potentialDuplicate(c,claims,modal.claim?.id);
         if(duplicate){notify(`Possible duplicate: ${duplicate.rank} ${duplicate.name} (${duplicate.province}). Review the existing record first.`);return;}
-        const normalized={...c,stage:normalizeWorkflow(c.stage),status:normalizeClaimStatus(c.status,c.stage),lastUpdateDate:isoToday()};
+        const normalizedStage=normalizeWorkflow(c.stage);
+        const normalized={...c,stage:normalizedStage,status:normalizeClaimStatus(c.status,normalizedStage),lastUpdateDate:isoToday()};
         try{if(db)await saveClaimWithAudit(normalized,modal.mode==="new"?"Claim created":"Claim updated");setClaims(prev => prev.some(x=>x.id===normalized.id)?prev.map(x=>x.id===normalized.id?normalized:x):[normalized,...prev]);setModal(null);notify(firebaseConfigured?`Record saved • ${new Date().toLocaleString("en-PH")}`:"Record saved in demonstration mode.");}catch{notify("Save failed. No partial record or audit entry was written.");}}}/>}
     </main>
   );
@@ -516,6 +518,33 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
   const [bulkDate,setBulkDate]=useState(isoToday());
   const [bulkAction,setBulkAction]=useState("");
   const toggle=(id:string)=>setSelected(previous=>previous.includes(id)?previous.filter(item=>item!==id):[...previous,id]);
+  const [migrationDone,setMigrationDone]=useState(false);
+  const [migrationBusy,setMigrationBusy]=useState(false);
+  const fixOutPatientRecords=async()=>{
+    if(p.role!=="administrator"||!db)return;
+    if(!confirm("Update all existing Out Patient KIPO/WIPO records to Status = Not Qualified?"))return;
+    setMigrationBusy(true);
+    try{
+      const snapshot=await getDocs(collection(db,"claims"));
+      const targets=snapshot.docs.filter(item=>{
+        const record=item.data() as Claim;
+        return normalizeWorkflow(record.stage)==="Out Patient";
+      });
+      if(!targets.length){setMigrationDone(true);p.notify("No Out Patient records needed updating.");return;}
+      const batch=writeBatch(db);
+      targets.forEach(item=>{
+        const record=item.data() as Claim;
+        batch.set(item.ref,{stage:"Out Patient",status:"Not Qualified",lastUpdateDate:isoToday()},{merge:true});
+      });
+      await batch.commit();
+      setMigrationDone(true);
+      p.notify(`${targets.length} Out Patient record${targets.length===1?"":"s"} updated in Firebase.`);
+    }catch(error){
+      p.notify(error instanceof Error?error.message:"Unable to update Out Patient records.");
+    }finally{
+      setMigrationBusy(false);
+    }
+  };
   const bulkUpdate=async()=>{
     if(!db||!selected.length||!bulkDate||!bulkAction.trim())return;
     if(selected.length>400){p.notify("Select no more than 400 records per bulk update.");return;}
@@ -530,7 +559,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
   return <div className="stack">
     <section className="toolbar panel"><div className="search"><Search/><input aria-label="Search claims" value={p.query} onChange={e=>p.setQuery(e.target.value)} placeholder="Search name, unit, status..."/></div><Select label="Claim type" value={p.type} change={p.setType} options={["All","KIPO","WIPO"]}/><Select label="Claim year" value={p.year} change={p.setYear} options={["All","2025","2026"]}/><Select label="Claim status" value={p.status} change={p.setStatus} options={["All","Pending","In Process","For Review","Completed","Not Qualified"]}/><button className="outline" onClick={p.exportExcel}><Download/>Export Excel</button>{p.role==="administrator"&&p.migrationAvailable&&<button className="outline" disabled={p.migrationBusy} onClick={p.migrateOutPatient}><RefreshCw/>{p.migrationBusy?"Updating…":"Fix Out Patient Records"}</button>}<button className="primary" onClick={()=>p.open({mode:"new"})}><Plus/>Add Personnel</button></section>
     {selected.length>0&&<section className="panel bulk-bar"><strong>{selected.length} selected {selected.length>400&&<small className="validation-error">Maximum 400</small>}</strong><label>Next follow-up<input type="date" value={bulkDate} onChange={e=>setBulkDate(e.target.value)}/></label><label>Action taken<input value={bulkAction} onChange={e=>setBulkAction(e.target.value)} placeholder="Enter common action taken"/></label><button className="primary" disabled={selected.length>400} onClick={bulkUpdate}><Send/>Apply Update</button><button className="outline" onClick={()=>setSelected([])}>Clear</button></section>}
-    <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
+    <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${normalizeClaimStatus(c.status,c.stage).toLowerCase().replace(" ","-")}`}>{normalizeClaimStatus(c.status,c.stage)}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
 }
 
