@@ -17,8 +17,22 @@ const displayDate = (value: string) => value
   ? new Date(`${value}T00:00:00`).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })
   : "";
 
-const nextRecordNo = (records: RheRecord[], year: 2025 | 2026) =>
-  Math.max(0, ...records.filter(record => record.year === year).map(record => Number(record.sourceNo) || 0)) + 1;
+const nextRecordNo = (records: RheRecord[], year: 2025 | 2026) => {
+  const sameYear = records.filter(record => record.year === year);
+  // The source workbook restarts its NO. column for each approval batch.
+  // Use the actual number of RHE records as the minimum so new entries continue
+  // after the full CY list (e.g. CY 2026 has 67 records, so the next is 68).
+  return Math.max(
+    sameYear.length,
+    0,
+    ...sameYear.map(record => Number(record.sourceNo) || 0),
+  ) + 1;
+};
+
+const rheIdOrder = (record: RheRecord) => {
+  const match = record.id.match(/^RHE-\d{4}-(\d+)$/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+};
 
 const emptyRheRecord = (records: RheRecord[]): RheRecord => {
   const year = 2026 as const;
@@ -55,9 +69,28 @@ export function RhePage({
   const [year, setYear] = useState("All");
   const [modal, setModal] = useState<RheModalState | null>(null);
 
+  const sortedRecords = useMemo(() => [...records].sort((a, b) =>
+    a.year - b.year ||
+    rheIdOrder(a) - rheIdOrder(b) ||
+    a.name.localeCompare(b.name)
+  ), [records]);
+
+  // Build a continuous display number per calendar year. This is intentionally
+  // separate from sourceNo because the Excel NO. column resets in several batches.
+  const displayNumbers = useMemo(() => {
+    const counters = new Map<number, number>();
+    const numbers = new Map<string, number>();
+    for (const record of sortedRecords) {
+      const next = (counters.get(record.year) || 0) + 1;
+      counters.set(record.year, next);
+      numbers.set(record.id, next);
+    }
+    return numbers;
+  }, [sortedRecords]);
+
   const filtered = useMemo(() => {
     const term = query.trim().toLowerCase();
-    return records.filter(record => {
+    return sortedRecords.filter(record => {
       if (year !== "All" && String(record.year) !== year) return false;
       if (!term) return true;
       return [
@@ -72,7 +105,7 @@ export function RhePage({
         record.remarks,
       ].join(" ").toLowerCase().includes(term);
     });
-  }, [records, query, year]);
+  }, [sortedRecords, query, year]);
 
   const totalAmount = filtered.reduce((sum, record) => sum + (Number(record.amount) || 0), 0);
 
@@ -132,7 +165,7 @@ export function RhePage({
             <tbody>
               {filtered.map(record => (
                 <tr key={record.id}>
-                  <td><strong>CY {record.year}</strong><small>No. {record.sourceNo}</small></td>
+                  <td><strong>CY {record.year}</strong><small>No. {displayNumbers.get(record.id) ?? record.sourceNo}</small></td>
                   <td><strong>{record.name}</strong></td>
                   <td>{record.unitAssignment}</td>
                   <td>{record.diagnosis}</td>
@@ -161,6 +194,7 @@ export function RhePage({
       {modal && (
         <RheModal
           record={modal.mode === "new" ? null : modal.record || null}
+          recordNumber={modal.mode === "new" ? undefined : (modal.record ? displayNumbers.get(modal.record.id) : undefined)}
           mode={modal.mode}
           records={records}
           close={() => setModal(null)}
@@ -177,12 +211,14 @@ export function RhePage({
 
 function RheModal({
   record,
+  recordNumber,
   mode,
   records,
   close,
   save,
 }: {
   record: RheRecord | null;
+  recordNumber?: number;
   mode: "new" | "view" | "edit";
   records: RheRecord[];
   close: () => void;
@@ -237,7 +273,7 @@ function RheModal({
                 <option value={2026}>2026</option>
               </select>
             </label>
-            <label>Record No.<input required value={String(data.sourceNo)} onChange={event => field("sourceNo", event.target.value)} /></label>
+            <label>Record No.<input readOnly value={String(recordNumber ?? data.sourceNo)} title="Continuous RHE record number for this calendar year" /></label>
             <label className="wide">Rank / Full Name<input required value={data.name} onChange={event => field("name", event.target.value)} placeholder="e.g., PCpl Juan D Dela Cruz" /></label>
             <label>Unit Assignment<input required value={data.unitAssignment} onChange={event => field("unitAssignment", event.target.value)} /></label>
             <label>Category<input required value={data.category} onChange={event => field("category", event.target.value)} placeholder="Medical Case / Surgical Case / Catastrophic Case" /></label>
