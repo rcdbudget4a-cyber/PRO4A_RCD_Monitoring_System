@@ -7,15 +7,17 @@ import { auth, db, firebaseConfigured } from "./firebase";
 import { seedClaims } from "./claims-data";
 import { retireeRecords } from "./retirees-data";
 import { optionalRetireeRecords } from "./optional-retirees-data";
+import { RhePage } from "./rhe-page";
+import { rheRecords } from "./rhe-data";
 import { exportClaimsExcel, exportRetireesExcel } from "./excel-export";
 import {
   Activity, AlertTriangle, BarChart3, Bell, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Clock3, Download,
   Archive, Eye, EyeOff, FileSpreadsheet, FileText, FolderOpen, Gauge, LayoutDashboard, LogOut, Menu,
   Moon, Pencil, Plus, RefreshCw, Search, Send, ShieldCheck,
-  Sun, Trash2, Trophy, Upload, UserCheck, UserCog, Users, X, BadgeCheck
+  Sun, Trash2, Trophy, Upload, UserCheck, UserCog, Users, X, BadgeCheck, HeartPulse
 } from "lucide-react";
 
-type Page = "dashboard" | "records" | "retirees" | "optional_retirees" | "compliance" | "reconcile" | "announcements" | "help" | "import" | "users" | "history" | "reports" | "archive" | "errors" | "validation" | "profile";
+type Page = "dashboard" | "records" | "rhe" | "retirees" | "optional_retirees" | "compliance" | "reconcile" | "announcements" | "help" | "import" | "users" | "history" | "reports" | "archive" | "errors" | "validation" | "profile";
 type Role = "administrator" | "unit_user";
 type ClaimModalState = { mode: "new" | "view" | "edit"; claim?: Claim };
 type UserProfile = {
@@ -96,6 +98,7 @@ const potentialDuplicate=(candidate:Claim,records:Claim[],excludeId="")=>records
 const nav = [
   ["dashboard", "Dashboard", LayoutDashboard],
   ["records", "KIPO/WIPO Records", FolderOpen],
+  ["rhe", "RHE", HeartPulse],
   ["retirees", "Compulsory Retirees", BadgeCheck],
   ["optional_retirees", "Optional Retirees", UserCheck],
   ["compliance", "Compliance & Scorecard", Trophy],
@@ -111,7 +114,7 @@ const nav = [
   ["validation", "Monthly Validation", Gauge],
   ["profile", "My Profile", UserCog],
 ] as const;
-const primaryNavKeys: Page[] = ["dashboard","records","retirees","optional_retirees","import","users"];
+const primaryNavKeys: Page[] = ["dashboard","records","rhe","retirees","optional_retirees","import","users"];
 const otherNavKeys: Page[] = ["compliance","reconcile","announcements","help","history","reports","archive","errors","validation","profile"];
 const administratorOnlyPages: Page[] = ["import","users","reconcile","archive","errors","validation"];
 
@@ -367,12 +370,13 @@ export default function Home() {
       <section className="main-area">
         <header className="topbar">
           <button className="menu-btn" onClick={()=>setMobileNav(true)}><Menu/></button>
-          <div><h2>{title}</h2><p>{page==="records" ? "Personnel registry, workflow, and documentary monitoring" : "Regional Comptrollership Division • PRO CALABARZON"}</p></div>
+          <div><h2>{title}</h2><p>{page==="records" ? "Personnel registry, workflow, and documentary monitoring" : page==="rhe" ? "Reimbursement of Hospitalization Expenses • CY 2025–2026" : "Regional Comptrollership Division • PRO CALABARZON"}</p></div>
           <div className="top-actions"><button onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button><span><ShieldCheck/>{role==="administrator"?"Administrator":"Unit User"}</span></div>
         </header>
         <div className="content">
-          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
+          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRhe={()=>setPage("rhe")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
           {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
+          {page==="rhe" && <RhePage/>}
           {page==="retirees" && <RetireesPage title="Compulsory Retirees" collectionName="retirees" initialData={retireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="optional_retirees" && <RetireesPage title="Optional Retirees" collectionName="optionalRetirees" initialData={optionalRetireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="compliance" && <CompliancePage claims={scopedClaims} retirees={scopedRetirees} profile={profile} role={role} notify={notify}/>}
@@ -406,13 +410,19 @@ export default function Home() {
   );
 }
 
-function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOptionalRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];optionalRetirees:Retiree[];goRecords:()=>void;goRetirees:()=>void;goOptionalRetirees:()=>void;displayName:string;unit:string}) {
+function Dashboard({claims,retirees,optionalRetirees,goRecords,goRhe,goRetirees,goOptionalRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];optionalRetirees:Retiree[];goRecords:()=>void;goRhe:()=>void;goRetirees:()=>void;goOptionalRetirees:()=>void;displayName:string;unit:string}) {
   const [claimView,setClaimView]=useState("All");
   const [retireeView,setRetireeView]=useState("All");
+  const [rheView,setRheView]=useState("All");
   const hour=new Date().getHours();
   const greeting=hour<12?"Good morning":hour<18?"Good afternoon":"Good evening";
   const visibleClaims=claimView==="All"?claims:claims.filter(c=>String(c.year)===claimView);
   const visibleRetirees=retireeView==="All"?retirees:retirees.filter(r=>String(r.year)===retireeView);
+  const visibleRhe=rheView==="All"?rheRecords:rheRecords.filter(r=>String(r.year)===rheView);
+  const rheGroup=(category:string)=>{const text=(category||"").trim().toLowerCase();if(text.includes("wipo"))return "WIPO";if(text.includes("catast"))return "Catastrophic";if(text.includes("surgical"))return "Surgical";if(text.includes("medical")||text.includes("medial"))return "Medical";return "Other";};
+  const rheCount=(group:string,records=visibleRhe)=>records.filter(r=>rheGroup(r.category)===group).length;
+  const rheAmount=(records=visibleRhe)=>records.reduce((sum,r)=>sum+(Number.isFinite(r.amount)?r.amount:0),0);
+  const rheCurrency=(value:number)=>new Intl.NumberFormat("en-PH",{style:"currency",currency:"PHP",notation:"compact",maximumFractionDigits:2}).format(value);
   const complete=visibleClaims.filter(c=>c.status==="Completed").length;
   const pending=visibleClaims.filter(c=>c.status!=="Completed").length;
   const calProcessed=(records:Retiree[])=>records.filter(isCalProcessed).length;
@@ -426,7 +436,7 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOpti
   const unassigned=retirees.filter(record=>!record.unit||record.unit==="Unassigned").length;
   const completionRate=visibleClaims.length?Math.round(complete/visibleClaims.length*100):0;
   return <div className="stack">
-    <section className="welcome compact-welcome"><div><p>{unit} Monitoring Overview</p><h3>{greeting}, {displayName}</h3><span>KIPO/WIPO claims, compulsory retirees, and optional retirees at a glance.</span></div></section>
+    <section className="welcome compact-welcome"><div><p>{unit} Monitoring Overview</p><h3>{greeting}, {displayName}</h3><span>KIPO/WIPO claims, RHE, compulsory retirees, and optional retirees at a glance.</span></div></section>
     <section className="combined-dashboard">
       <article className="dashboard-module panel">
         <div className="module-heading"><div><span className="module-kicker">Personnel Claims</span><h3>KIPO/WIPO Dashboard</h3></div><div className="year-switch" aria-label="KIPO/WIPO year filter">{["All","2025","2026"].map(y=><button key={y} className={claimView===y?"active":""} onClick={()=>setClaimView(y)}>{y}</button>)}</div></div>
@@ -455,6 +465,21 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRetirees,goOpti
           <button className="module-link" style={{flex:1}} onClick={goRetirees}>Compulsory Retirees <span>→</span></button>
           <button className="module-link" style={{flex:1,background:"var(--panel2)",borderColor:"var(--line)"}} onClick={goOptionalRetirees}>Optional Retirees <span>→</span></button>
         </div>
+      </article>
+      <article className="dashboard-module panel" style={{gridColumn:"1 / -1"}}>
+        <div className="module-heading"><div><span className="module-kicker">Hospitalization Benefits</span><h3>Reimbursement of Hospitalization Expenses (RHE)</h3></div><div className="year-switch" aria-label="RHE year filter">{["All","2025","2026"].map(y=><button key={y} className={rheView===y?"active":""} onClick={()=>setRheView(y)}>{y}</button>)}</div></div>
+        <div className="retiree-main-metrics">
+          <div><span>Total RHE Cases</span><strong>{visibleRhe.length}</strong></div>
+          <div className="processed"><span>Total Approved Amount</span><strong>{rheCurrency(rheAmount())}</strong></div>
+          <div className="processed"><span>Medical</span><strong>{rheCount("Medical")}</strong></div>
+          <div className="processed"><span>Surgical</span><strong>{rheCount("Surgical")}</strong></div>
+          <div className="processed"><span>Catastrophic</span><strong>{rheCount("Catastrophic")}</strong></div>
+          <div className="processed"><span>WIPO Cases</span><strong>{rheCount("WIPO")}</strong></div>
+        </div>
+        <div className="year-comparison">
+          {[2025,2026].map(year=>{const rows=rheRecords.filter(r=>r.year===year);return <div key={year}><b>CY {year}</b><span><strong>{rows.length}</strong> Cases</span><span><strong>{rheCurrency(rheAmount(rows))}</strong> Approved</span><span><strong>{rheCount("WIPO",rows)}</strong> WIPO</span></div>;})}
+        </div>
+        <button className="module-link" onClick={goRhe}>View RHE Records <span>→</span></button>
       </article>
     </section>
     <section className="dash-grid">
@@ -485,6 +510,7 @@ function Records(p:{role:Role;profile:UserProfile;claims:Claim[];query:string;se
     <section className="panel registry"><PanelHead title="Personnel Claims Registry" copy={`${p.claims.length} records • Select personnel for bulk follow-up updates`} action={<button className="icon-button" aria-label="Check synchronization" title="Check synchronization" onClick={p.refresh}><RefreshCw/></button>}/><div className="table-wrap"><table><thead><tr><th><input aria-label="Select all visible records" type="checkbox" checked={Boolean(p.claims.length)&&selected.length===p.claims.length} onChange={e=>setSelected(e.target.checked?p.claims.map(c=>c.id):[])}/></th><th>Type / Year</th><th>Rank / Name</th><th>Date of Incident</th><th>Unit / Office</th><th>Workflow</th><th>Status</th><th>Actions</th></tr></thead><tbody>{p.claims.map(c=><tr key={c.id}><td><input aria-label={`Select ${c.rank} ${c.name}`} type="checkbox" checked={selected.includes(c.id)} onChange={()=>toggle(c.id)}/></td><td><em className={`type ${c.type.toLowerCase()}`}>{c.type}</em><small>CY {c.year}</small></td><td><strong>{c.rank} {c.name}</strong></td><td><strong>{c.dateDisplay || c.date}</strong><small>{c.sourceCoverage}</small></td><td>{c.province}<small>{c.office}</small></td><td><span className="stage">{c.stage}</span></td><td><span className={`status ${c.status.toLowerCase().replace(" ","-")}`}>{c.status}</span></td><td><div className="actions"><button title="View" aria-label={`View record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"view",claim:c})}><Eye/></button><button className="edit" title="Edit" aria-label={`Edit record of ${c.rank} ${c.name}`} onClick={()=>p.open({mode:"edit",claim:c})}><Pencil/></button>{p.role==="administrator"&&<button className="delete" title="Archive" aria-label={`Archive record of ${c.rank} ${c.name}`} onClick={()=>p.remove(c.id)}><Archive/></button>}</div></td></tr>)}</tbody></table>{!p.claims.length&&<div className="empty">No matching records found.</div>}</div></section>
   </div>
 }
+
 
 type Retiree = {
   id:string; year:number; rank:string; name:string; retirementDate:string; retirementDisplay:string;
