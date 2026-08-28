@@ -8,7 +8,7 @@ import { seedClaims } from "./claims-data";
 import { retireeRecords } from "./retirees-data";
 import { optionalRetireeRecords } from "./optional-retirees-data";
 import { RhePage } from "./rhe-page";
-import { rheRecords } from "./rhe-data";
+import { rheRecords, type RheRecord } from "./rhe-data";
 import { exportClaimsExcel, exportRetireesExcel } from "./excel-export";
 import {
   Activity, AlertTriangle, BarChart3, Bell, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Clock3, Download,
@@ -131,6 +131,7 @@ export default function Home() {
   const [claims, setClaims] = useState<Claim[]>(seedClaims as Claim[]);
   const [retirees, setRetirees] = useState<Retiree[]>(retireeRecords as Retiree[]);
   const [optionalRetirees, setOptionalRetirees] = useState<Retiree[]>(optionalRetireeRecords as Retiree[]);
+  const [rhe, setRhe] = useState<RheRecord[]>(rheRecords as RheRecord[]);
   const [query, setQuery] = useState("");
   const [type, setType] = useState("All");
   const [status, setStatus] = useState("All");
@@ -233,6 +234,21 @@ export default function Home() {
     }, error => { void recordSystemError("Optional retiree synchronization failed",error); });
   }, [profile]);
   const scopedOptionalRetirees = useMemo(() => role==="administrator" ? optionalRetirees : optionalRetirees.filter(r=>sameUnit(r.unit,profile?.unit)), [optionalRetirees,role,profile?.unit]);
+  useEffect(() => {
+    if (!db || !profile) return;
+    return onSnapshot(collection(db, "rheRecords"), snapshot => {
+      const docs = snapshot.docs.map(item => item.data() as RheRecord);
+      if (snapshot.empty && profile.role === "admin") {
+        const batch = writeBatch(db);
+        (rheRecords as RheRecord[]).forEach(record => batch.set(doc(db, "rheRecords", record.id), record));
+        batch.commit().catch(error => { void recordSystemError("RHE initial data synchronization failed", error); });
+        setRhe(rheRecords as RheRecord[]);
+      } else {
+        setRhe(docs);
+      }
+      setLastSyncAt(new Date());
+    }, error => { void recordSystemError("RHE synchronization failed", error); setToast("Unable to load RHE records."); setTimeout(() => setToast(""), 2500); });
+  }, [profile]);
   const filtered = useMemo(() => scopedClaims.filter(c => {
     const haystack = `${c.id} ${c.rank} ${c.name} ${c.province} ${c.office} ${c.status}`.toLowerCase();
     return haystack.includes(query.toLowerCase()) && (type === "All" || c.type === type) && (claimYear === "All" || String(c.year) === claimYear) && (status === "All" || c.status === status);
@@ -259,6 +275,53 @@ export default function Home() {
       oldValue:claims.find(item=>item.id===claim.id)||null,newValue:claim,createdAt:serverTimestamp()
     });
     await batch.commit();
+  };
+  const saveRheRecord = async (record:RheRecord, mode:"new"|"edit") => {
+    if (role !== "administrator") { notify("Only administrators can add or edit RHE records."); return false; }
+    const duplicate = rhe.find(item => item.id !== record.id && item.year === record.year && item.name.trim().toLowerCase() === record.name.trim().toLowerCase() && item.dateOfConfinement.trim().toLowerCase() === record.dateOfConfinement.trim().toLowerCase());
+    if (duplicate) { notify(`Possible duplicate RHE record: ${duplicate.name} (CY ${duplicate.year}).`); return false; }
+    try {
+      if (db && currentUser) {
+        const batch = writeBatch(db);
+        batch.set(doc(db, "rheRecords", record.id), sanitizeRecord(record));
+        batch.set(doc(collection(db, "activityHistory")), {
+          action: mode === "new" ? "RHE record created" : "RHE record updated", details: `${record.name} • CY ${record.year}`,
+          recordType: "rhe", recordId: record.id, unit: profile?.unit || "RCD", actorUid: currentUser.uid,
+          actorName: profile?.displayName || "Administrator", actorRole: profile?.role || "admin",
+          oldValue: rhe.find(item => item.id === record.id) || null, newValue: record, createdAt: serverTimestamp()
+        });
+        await batch.commit();
+      }
+      setRhe(previous => previous.some(item => item.id === record.id) ? previous.map(item => item.id === record.id ? record : item) : [record, ...previous]);
+      notify(mode === "new" ? "RHE personnel added." : "RHE record updated.");
+      return true;
+    } catch (error) {
+      void recordSystemError("RHE save failed", error);
+      notify("RHE save failed. No record was changed.");
+      return false;
+    }
+  };
+  const deleteRheRecord = async (record:RheRecord) => {
+    if (role !== "administrator") { notify("Only administrators can delete RHE records."); return; }
+    const confirmed = confirm(`Delete the RHE record of ${record.name}? This action cannot be undone.`);
+    if (!confirmed) return;
+    try {
+      if (db && currentUser) {
+        const batch = writeBatch(db);
+        batch.delete(doc(db, "rheRecords", record.id));
+        batch.set(doc(collection(db, "activityHistory")), {
+          action: "RHE record deleted", details: `${record.name} • CY ${record.year}`, recordType: "rhe", recordId: record.id,
+          unit: profile?.unit || "RCD", actorUid: currentUser.uid, actorName: profile?.displayName || "Administrator",
+          actorRole: profile?.role || "admin", oldValue: record, newValue: null, createdAt: serverTimestamp()
+        });
+        await batch.commit();
+      }
+      setRhe(previous => previous.filter(item => item.id !== record.id));
+      notify("RHE record deleted.");
+    } catch (error) {
+      void recordSystemError("RHE delete failed", error);
+      notify("RHE delete failed. No record was removed.");
+    }
   };
   const title = nav.find(n => n[0] === page)?.[1] ?? "Dashboard";
   const canOpenPage=(key:Page)=>!administratorOnlyPages.includes(key)||role==="administrator";
@@ -374,9 +437,9 @@ export default function Home() {
           <div className="top-actions"><button onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button><span><ShieldCheck/>{role==="administrator"?"Administrator":"Unit User"}</span></div>
         </header>
         <div className="content">
-          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} goRecords={()=>setPage("records")} goRhe={()=>setPage("rhe")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
+          {page==="dashboard" && <Dashboard claims={scopedClaims} retirees={scopedRetirees} optionalRetirees={scopedOptionalRetirees} rhe={rhe} goRecords={()=>setPage("records")} goRhe={()=>setPage("rhe")} goRetirees={()=>setPage("retirees")} goOptionalRetirees={()=>setPage("optional_retirees")} displayName={profile.displayName} unit={profile.unit}/>}
           {page==="records" && <Records role={role} profile={profile} claims={filtered} query={query} setQuery={setQuery} type={type} setType={setType} year={claimYear} setYear={setClaimYear} status={status} setStatus={setStatus} exportExcel={exportExcel} open={setModal} notify={notify} refresh={()=>notify(`Last successful synchronization • ${lastSyncAt?.toLocaleTimeString("en-PH",{hour:"2-digit",minute:"2-digit"})||"not yet available"}`)} remove={async(id)=>{if(role!=="administrator"||!db||!currentUser){notify("Only administrators can archive records.");return;}const record=claims.find(c=>c.id===id);if(!record)return;const reason=prompt("Reason for archiving this claim:")?.trim();if(!reason){notify("Archive cancelled. A reason is required.");return;}try{const batch=writeBatch(db);const archiveRef=doc(collection(db,"archivedRecords"));batch.set(archiveRef,{sourceCollection:"claims",sourceId:id,data:record,reason,archivedBy:profile.displayName,archivedUid:currentUser.uid,archivedAt:serverTimestamp()});batch.delete(doc(db,"claims",id));batch.set(doc(collection(db,"activityHistory")),{action:"Claim archived",details:`${record.rank} ${record.name} • ${reason}`,recordType:"claim",recordId:id,unit:record.province,actorUid:currentUser.uid,actorName:profile.displayName,actorRole:profile.role,oldValue:record,newValue:{archived:true,reason},createdAt:serverTimestamp()});await batch.commit();notify("Claim archived and recoverable.");}catch(error){void recordSystemError("Claim archive failed",error);notify("Archive failed. No record was removed.");}}}/>}
-          {page==="rhe" && <RhePage/>}
+          {page==="rhe" && <RhePage records={rhe} role={role} save={saveRheRecord} remove={deleteRheRecord}/>}
           {page==="retirees" && <RetireesPage title="Compulsory Retirees" collectionName="retirees" initialData={retireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="optional_retirees" && <RetireesPage title="Optional Retirees" collectionName="optionalRetirees" initialData={optionalRetireeRecords as Retiree[]} role={role} profile={profile} notify={notify}/>}
           {page==="compliance" && <CompliancePage claims={scopedClaims} retirees={scopedRetirees} profile={profile} role={role} notify={notify}/>}
@@ -410,7 +473,7 @@ export default function Home() {
   );
 }
 
-function Dashboard({claims,retirees,optionalRetirees,goRecords,goRhe,goRetirees,goOptionalRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];optionalRetirees:Retiree[];goRecords:()=>void;goRhe:()=>void;goRetirees:()=>void;goOptionalRetirees:()=>void;displayName:string;unit:string}) {
+function Dashboard({claims,retirees,optionalRetirees,rhe,goRecords,goRhe,goRetirees,goOptionalRetirees,displayName,unit}:{claims:Claim[];retirees:Retiree[];optionalRetirees:Retiree[];rhe:RheRecord[];goRecords:()=>void;goRhe:()=>void;goRetirees:()=>void;goOptionalRetirees:()=>void;displayName:string;unit:string}) {
   const [claimView,setClaimView]=useState("All");
   const [retireeView,setRetireeView]=useState("All");
   const [rheView,setRheView]=useState("All");
@@ -418,7 +481,7 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRhe,goRetirees,
   const greeting=hour<12?"Good morning":hour<18?"Good afternoon":"Good evening";
   const visibleClaims=claimView==="All"?claims:claims.filter(c=>String(c.year)===claimView);
   const visibleRetirees=retireeView==="All"?retirees:retirees.filter(r=>String(r.year)===retireeView);
-  const visibleRhe=rheView==="All"?rheRecords:rheRecords.filter(r=>String(r.year)===rheView);
+  const visibleRhe=rheView==="All"?rhe:rhe.filter(r=>String(r.year)===rheView);
   const rheGroup=(category:string)=>{const text=(category||"").trim().toLowerCase();if(text.includes("wipo"))return "WIPO";if(text.includes("catast"))return "Catastrophic";if(text.includes("surgical"))return "Surgical";if(text.includes("medical")||text.includes("medial"))return "Medical";return "Other";};
   const rheCount=(group:string,records=visibleRhe)=>records.filter(r=>rheGroup(r.category)===group).length;
   const rheAmount=(records=visibleRhe)=>records.reduce((sum,r)=>sum+(Number.isFinite(r.amount)?r.amount:0),0);
@@ -477,7 +540,7 @@ function Dashboard({claims,retirees,optionalRetirees,goRecords,goRhe,goRetirees,
           <div className="processed"><span>WIPO Cases</span><strong>{rheCount("WIPO")}</strong></div>
         </div>
         <div className="year-comparison">
-          {[2025,2026].map(year=>{const rows=rheRecords.filter(r=>r.year===year);return <div key={year}><b>CY {year}</b><span><strong>{rows.length}</strong> Cases</span><span><strong>{rheCurrency(rheAmount(rows))}</strong> Approved</span><span><strong>{rheCount("WIPO",rows)}</strong> WIPO</span></div>;})}
+          {[2025,2026].map(year=>{const rows=rhe.filter(r=>r.year===year);return <div key={year}><b>CY {year}</b><span><strong>{rows.length}</strong> Cases</span><span><strong>{rheCurrency(rheAmount(rows))}</strong> Approved</span><span><strong>{rheCount("WIPO",rows)}</strong> WIPO</span></div>;})}
         </div>
         <button className="module-link" onClick={goRhe}>View RHE Records <span>→</span></button>
       </article>
